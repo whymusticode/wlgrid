@@ -669,6 +669,7 @@ fn native_options_from_cfg(cfg: &Config) -> eframe::NativeOptions {
             ])
             .with_resizable(false)
             .with_transparent(cfg.window_transparent),
+        renderer: eframe::Renderer::Glow, // Wgpu fails on Wayland (surface backend); Glow works
         ..Default::default()
     }
 }

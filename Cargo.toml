@@ -10,3 +10,5 @@ toml = "0.9"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 walkdir = "2"
 libloading = "0.8"
+winit = { version = "0.30.13", default-features = false, features = ["wayland", "x11", "rwh_06"] }
+softbuffer = "0.4.8"

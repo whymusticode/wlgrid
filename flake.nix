@@ -19,19 +19,19 @@
               pkg-config
               wayland
               libxkbcommon
-              xorg.libX11
-              xorg.libXcursor
-              xorg.libXi
-              xorg.libXrandr
+              libx11
+              libxcursor
+              libxi
+              libxrandr
               mesa
             ];
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.wayland
               pkgs.libxkbcommon
-              pkgs.xorg.libX11
-              pkgs.xorg.libXcursor
-              pkgs.xorg.libXi
-              pkgs.xorg.libXrandr
+              pkgs.libx11
+              pkgs.libxcursor
+              pkgs.libxi
+              pkgs.libxrandr
               pkgs.mesa
             ];
           };

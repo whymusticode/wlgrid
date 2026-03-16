@@ -652,7 +652,7 @@ impl eframe::App for App {
     }
 }
 
-fn native_options_from_cfg(cfg: &Config) -> eframe::NativeOptions {
+fn native_options_from_cfg(cfg: &Config, transparent: bool) -> eframe::NativeOptions {
     let w = cfg.width.max(1);
     let h = cfg.height.max(1);
     let tile = cfg.icon_size.clamp(40.0, 220.0);
@@ -666,7 +666,7 @@ fn native_options_from_cfg(cfg: &Config) -> eframe::NativeOptions {
                 h as f32 * tile + (h.saturating_sub(1) as f32 * gap) + bottom_gap + bar_h + 14.0,
             ])
             .with_resizable(false)
-            .with_transparent(true),
+            .with_transparent(transparent),
         ..Default::default()
     }
 }
@@ -686,8 +686,8 @@ fn backend_debug_snapshot() -> String {
         .join(" | ")
 }
 
-fn run_app(cfg: &Config) -> Result<(), eframe::Error> {
-    let native = native_options_from_cfg(cfg);
+fn run_app(cfg: &Config, transparent: bool) -> Result<(), eframe::Error> {
+    let native = native_options_from_cfg(cfg, transparent);
     eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new()))))
 }
 
@@ -707,7 +707,12 @@ fn main() -> Result<(), eframe::Error> {
         unsafe { env::remove_var("WAYLAND_DISPLAY") };
         eprintln!("wlgrid preflight env: {}", backend_debug_snapshot());
     }
-    match run_app(&cfg) {
+    let backend = env::var("WINIT_UNIX_BACKEND").unwrap_or_default().to_ascii_lowercase();
+    let transparent = backend != "x11";
+    if !transparent {
+        eprintln!("wlgrid: disabling transparent window on X11 backend");
+    }
+    match run_app(&cfg, transparent) {
         Ok(()) => Ok(()),
         Err(e) => {
             eprintln!("wlgrid startup error: {}", e);

@@ -661,9 +661,7 @@ fn native_options_from_cfg(cfg: &Config) -> eframe::NativeOptions {
     let gap = cfg.tile_gap.clamp(0.0, 24.0);
     let bottom_gap = cfg.bottom_gap.clamp(0.0, 24.0);
     let bar_h = 38.0;
-    let on_wayland = env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
-        || env::var("WAYLAND_DISPLAY").is_ok();
-    let mut opt = eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([
                 w as f32 * tile + (w.saturating_sub(1) as f32 * gap) + 16.0,
@@ -672,11 +670,7 @@ fn native_options_from_cfg(cfg: &Config) -> eframe::NativeOptions {
             .with_resizable(false)
             .with_transparent(cfg.window_transparent),
         ..Default::default()
-    };
-    if on_wayland {
-        opt.renderer = eframe::Renderer::Wgpu;
     }
-    opt
 }
 
 fn backend_debug_snapshot() -> String {

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.31", default-features = true, features = ["wayland", "x11"] }
+eframe = { version = "0.31", default-features = true, features = ["wayland", "x11", "wgpu"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

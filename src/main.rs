@@ -1,12 +1,15 @@
-use eframe::egui::{self, Align, Button, Layout, Sense, TextEdit};
+use eframe::egui::{self, Align, Layout, Sense};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
+use walkdir::WalkDir;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
@@ -17,26 +20,46 @@ struct Entry {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(default)]
 struct BottomBar {
     options: String,
     commands: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(default)]
 struct Config {
     width: usize,
     height: usize,
+    opacity: f32,
+    icon_size: f32,
+    tile_gap: f32,
+    bottom_gap: f32,
+    #[serde(skip_serializing, skip_deserializing, default)]
     tiles: Vec<Option<String>>,
     custom_entries: Vec<Entry>,
     bottom_bar: BottomBar,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct TileLayout {
+    tiles: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct LegacyTileLayout {
+    tiles: Vec<Option<String>>,
+}
+
 struct App {
     cfg: Config,
-    cfg_path: PathBuf,
+    layout_path: PathBuf,
     all_entries: HashMap<String, Entry>,
+    icon_index: HashMap<String, PathBuf>,
+    textures: HashMap<String, egui::TextureHandle>,
+    missing_textures: HashSet<String>,
     picker_open: bool,
-    picker_filter: String,
+    picker_target: Option<usize>,
     drag_from: Option<usize>,
     status: String,
 }
@@ -46,47 +69,116 @@ fn config_path() -> PathBuf {
     PathBuf::from(home).join(".config/wlgrid/config.toml")
 }
 
+fn layout_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config/wlgrid/tile_layout.toml")
+}
+
 fn default_config() -> Config {
-    let options = "󰍃    Logout\n󰑓    Reboot\n󰐥    Shutdown\n󰒲    Hibernate\n󰤄    Suspend";
-    let commands = [
-        ("Logout".to_string(), "loginctl terminate-user \"$USER\"".to_string()),
-        ("Reboot".to_string(), "systemctl reboot".to_string()),
-        ("Shutdown".to_string(), "systemctl poweroff".to_string()),
-        ("Hibernate".to_string(), "systemctl hibernate".to_string()),
-        ("Suspend".to_string(), "systemctl suspend".to_string()),
-    ]
-    .into_iter()
-    .collect();
-    Config {
-        width: 6,
-        height: 4,
-        tiles: vec![None; 24],
-        custom_entries: vec![],
-        bottom_bar: BottomBar { options: options.into(), commands },
+    Config::default()
+}
+
+impl Default for BottomBar {
+    fn default() -> Self {
+        let options = "Logout\nReboot\nShutdown\nHibernate\nSuspend";
+        let commands = [
+            ("Logout".to_string(), "loginctl terminate-user \"$USER\"".to_string()),
+            ("Reboot".to_string(), "systemctl reboot".to_string()),
+            ("Shutdown".to_string(), "systemctl poweroff".to_string()),
+            ("Hibernate".to_string(), "systemctl hibernate".to_string()),
+            ("Suspend".to_string(), "systemctl suspend".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        Self { options: options.into(), commands }
     }
 }
 
-fn ensure_config(path: &Path) -> Config {
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            width: 6,
+            height: 4,
+            opacity: 0.9,
+            icon_size: 96.0,
+            tile_gap: 8.0,
+            bottom_gap: 6.0,
+            tiles: vec![None; 24],
+            custom_entries: vec![],
+            bottom_bar: BottomBar::default(),
+        }
+    }
+}
+
+fn ensure_config(path: &Path) -> (Config, String) {
     if let Ok(text) = fs::read_to_string(path) {
+        if text.trim().is_empty() {
+            return (default_config(), "config.toml is empty, using defaults".into());
+        }
         if let Ok(mut cfg) = toml::from_str::<Config>(&text) {
             let len = cfg.width.saturating_mul(cfg.height);
             cfg.tiles.resize(len, None);
-            return cfg;
+            cfg.opacity = cfg.opacity.clamp(0.15, 1.0);
+            cfg.icon_size = cfg.icon_size.clamp(40.0, 220.0);
+            cfg.tile_gap = cfg.tile_gap.clamp(0.0, 24.0);
+            cfg.bottom_gap = cfg.bottom_gap.clamp(0.0, 24.0);
+            return (cfg, String::new());
         }
+        return (default_config(), "config.toml parse failed, using defaults".into());
     }
-    let cfg = default_config();
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let _ = fs::write(path, toml::to_string_pretty(&cfg).unwrap_or_default());
-    cfg
+    (default_config(), String::new())
 }
 
-fn save_config(path: &Path, cfg: &Config) -> Result<(), String> {
+fn load_layout(path: &Path, cfg: &mut Config) -> Result<(), String> {
+    if let Ok(text) = fs::read_to_string(path) {
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        match toml::from_str::<TileLayout>(&text) {
+            Ok(layout) => {
+                cfg.tiles = layout
+                    .tiles
+                    .into_iter()
+                    .map(|t| if t.trim().is_empty() { None } else { Some(t) })
+                    .collect();
+                cfg.tiles.resize(cfg.width.saturating_mul(cfg.height), None);
+            }
+            Err(e1) => match toml::from_str::<LegacyTileLayout>(&text) {
+                Ok(layout) => {
+                    cfg.tiles = layout.tiles;
+                    cfg.tiles.resize(cfg.width.saturating_mul(cfg.height), None);
+                }
+                Err(_) => {
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let bad = path.with_extension(format!("bad-{ts}.toml"));
+                    fs::rename(path, bad).map_err(|x| format!("layout parse error: {e1}; backup failed: {x}"))?;
+                    return Err(format!("layout parse error: {e1}; broken file moved"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn save_layout(path: &Path, cfg: &Config) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    fs::write(path, toml::to_string_pretty(cfg).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    let data = TileLayout {
+        tiles: cfg.tiles.iter().map(|t| t.clone().unwrap_or_default()).collect(),
+    };
+    atomic_write(path, toml::to_string_pretty(&data).map_err(|e| e.to_string())?.as_bytes())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 fn desktop_dirs() -> Vec<PathBuf> {
@@ -153,6 +245,68 @@ fn load_entries(cfg: &Config) -> HashMap<String, Entry> {
     map
 }
 
+fn icon_roots() -> Vec<PathBuf> {
+    let home = env::var("HOME").unwrap_or_default();
+    let mut out = vec![
+        PathBuf::from(format!("{home}/.icons")),
+        PathBuf::from(format!("{home}/.local/share/icons")),
+        PathBuf::from("/usr/share/icons"),
+        PathBuf::from("/usr/local/share/icons"),
+        PathBuf::from("/usr/share/pixmaps"),
+        PathBuf::from("/usr/local/share/pixmaps"),
+    ];
+    if let Ok(extra) = env::var("XDG_DATA_DIRS") {
+        out.extend(extra.split(':').map(|d| PathBuf::from(d).join("icons")));
+        out.extend(extra.split(':').map(|d| PathBuf::from(d).join("pixmaps")));
+    }
+    out
+}
+
+fn is_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp"))
+}
+
+fn build_icon_index() -> HashMap<String, PathBuf> {
+    let mut idx = HashMap::new();
+    for root in icon_roots().into_iter().filter(|p| p.exists()) {
+        for e in WalkDir::new(root).max_depth(6).into_iter().flatten() {
+            let p = e.path();
+            if !p.is_file() || !is_image(p) {
+                continue;
+            }
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                idx.entry(stem.to_ascii_lowercase()).or_insert_with(|| p.to_path_buf());
+            }
+        }
+    }
+    idx
+}
+
+fn resolve_icon_path(icon: &str, idx: &HashMap<String, PathBuf>) -> Option<PathBuf> {
+    if icon.trim().is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(icon);
+    if p.is_file() && is_image(&p) {
+        return Some(p);
+    }
+    let base = icon.trim().rsplit('/').next().unwrap_or(icon).to_ascii_lowercase();
+    idx.get(&base)
+        .cloned()
+        .or_else(|| idx.get(base.split('.').next().unwrap_or("")).cloned())
+}
+
+fn load_texture(ctx: &egui::Context, key: &str, path: &Path) -> Option<egui::TextureHandle> {
+    let bytes = fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let pixels = img.into_vec();
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+    Some(ctx.load_texture(key.to_string(), color, Default::default()))
+}
+
 fn clean_exec(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut skip_next = false;
@@ -179,47 +333,121 @@ fn run_shell(cmd: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn option_label(line: &str) -> String {
+fn power_label(line: &str, commands: &HashMap<String, String>) -> String {
+    let line = line.trim().to_string();
+    if commands.contains_key(&line) {
+        return line;
+    }
     let mut parts = line.split_whitespace();
     let _ = parts.next();
-    parts.collect::<Vec<_>>().join(" ")
+    let fallback = parts.collect::<Vec<_>>().join(" ");
+    if commands.contains_key(&fallback) {
+        fallback
+    } else {
+        line
+    }
+}
+
+fn parse_power_pairs(options: &str, fallback: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for l in options.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some((k, v)) = l.split_once('=') {
+            let key = k.trim().to_string();
+            let val = v.trim().to_string();
+            if !key.is_empty() && !val.is_empty() {
+                out.push((key, val));
+                continue;
+            }
+        }
+        let label = power_label(l, fallback);
+        if let Some(cmd) = fallback.get(&label) {
+            out.push((label, cmd.clone()));
+        }
+    }
+    out
 }
 
 impl App {
     fn new() -> Self {
         let cfg_path = config_path();
-        let cfg = ensure_config(&cfg_path);
+        let layout_path = layout_path();
+        let (mut cfg, cfg_status) = ensure_config(&cfg_path);
+        let layout_status = load_layout(&layout_path, &mut cfg).err().unwrap_or_default();
+        let status = match (cfg_status.is_empty(), layout_status.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => cfg_status,
+            (true, false) => layout_status,
+            (false, false) => format!("{cfg_status}; {layout_status}"),
+        };
+        if !status.is_empty() {
+            eprintln!("{status}");
+        }
         let all_entries = load_entries(&cfg);
+        let icon_index = build_icon_index();
         Self {
             cfg,
-            cfg_path,
+            layout_path,
             all_entries,
+            icon_index,
+            textures: HashMap::new(),
+            missing_textures: HashSet::new(),
             picker_open: false,
-            picker_filter: String::new(),
+            picker_target: None,
             drag_from: None,
-            status: String::new(),
+            status,
+        }
+    }
+
+    fn icon_for_entry(&mut self, ctx: &egui::Context, e: &Entry) -> Option<egui::TextureHandle> {
+        let icon = e.icon.as_deref()?;
+        if self.missing_textures.contains(icon) {
+            return None;
+        }
+        if let Some(t) = self.textures.get(icon) {
+            return Some(t.clone());
+        }
+        let Some(path) = resolve_icon_path(icon, &self.icon_index) else {
+            self.missing_textures.insert(icon.to_string());
+            return None;
+        };
+        if let Some(t) = load_texture(ctx, icon, &path) {
+            self.textures.insert(icon.to_string(), t.clone());
+            Some(t)
+        } else {
+            self.missing_textures.insert(icon.to_string());
+            None
         }
     }
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = save_layout(&self.layout_path, &self.cfg);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("+ Add").clicked() {
-                    self.picker_open = true;
-                }
-                if ui.button("Reload").clicked() {
-                    self.cfg = ensure_config(&self.cfg_path);
-                    self.all_entries = load_entries(&self.cfg);
-                }
-                if ui.button("Save").clicked() {
-                    self.status = save_config(&self.cfg_path, &self.cfg).map(|_| "saved".into()).unwrap_or_else(|e| e);
-                }
-                if !self.status.is_empty() {
-                    ui.label(&self.status);
-                }
-            });
+        let w = self.cfg.width.max(1);
+        let h = self.cfg.height.max(1);
+        let tile = self.cfg.icon_size.clamp(40.0, 220.0);
+        let gap = self.cfg.tile_gap.clamp(0.0, 24.0);
+        let bottom_gap = self.cfg.bottom_gap.clamp(0.0, 24.0);
+        let bar_h = 38.0;
+        let target_size = egui::vec2(
+            w as f32 * tile + (w.saturating_sub(1) as f32 * gap) + 16.0,
+            h as f32 * tile + (h.saturating_sub(1) as f32 * gap) + bottom_gap + bar_h + 14.0,
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_size));
+
+        let alpha = (self.cfg.opacity.clamp(0.15, 1.0) * 255.0) as u8;
+        ctx.style_mut(|s| {
+            let panel = egui::Color32::from_rgba_unmultiplied(18, 18, 18, alpha);
+            s.visuals.panel_fill = panel;
+            s.visuals.window_fill = panel;
+            s.visuals.widgets.noninteractive.bg_fill = panel;
+            s.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgba_unmultiplied(45, 45, 45, alpha);
+            s.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgba_unmultiplied(70, 70, 70, alpha);
+            s.visuals.widgets.active.bg_fill = egui::Color32::from_rgba_unmultiplied(85, 85, 85, alpha);
+            s.visuals.widgets.open.bg_fill = egui::Color32::from_rgba_unmultiplied(55, 55, 55, alpha);
         });
 
         if self.picker_open {
@@ -229,20 +457,38 @@ impl eframe::App for App {
                 .open(&mut picker_open)
                 .resizable(true)
                 .show(ctx, |ui| {
-                    ui.add(TextEdit::singleline(&mut self.picker_filter).hint_text("filter"));
-                    let mut all = self.all_entries.values().collect::<Vec<_>>();
+                    let mut all = self.all_entries.values().cloned().collect::<Vec<_>>();
                     all.sort_by_key(|e| e.name.to_lowercase());
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for e in all.into_iter().filter(|e| {
-                            self.picker_filter.is_empty()
-                                || e.name.to_lowercase().contains(&self.picker_filter.to_lowercase())
-                                || e.id.to_lowercase().contains(&self.picker_filter.to_lowercase())
-                        }) {
-                            if ui.button(format!("{}{}", e.icon.clone().unwrap_or_default(), if e.icon.is_some() { " " } else { "" }) + &e.name).clicked()
-                            {
-                                if let Some(i) = self.cfg.tiles.iter().position(Option::is_none) {
-                                    self.cfg.tiles[i] = Some(e.id.clone());
-                                    self.status = save_config(&self.cfg_path, &self.cfg).map(|_| "added".into()).unwrap_or_else(|x| x);
+                        let icon_size = egui::vec2((tile * 0.5).clamp(32.0, 72.0), (tile * 0.5).clamp(32.0, 72.0));
+                        for e in all {
+                            let clicked = ui
+                                .horizontal(|ui| {
+                                    let (rect, r) = ui.allocate_exact_size(icon_size, Sense::click());
+                                    let fill = ui.style().visuals.widgets.inactive.bg_fill;
+                                    ui.painter().rect_filled(rect, 6.0, fill);
+                                    if let Some(t) = self.icon_for_entry(ctx, &e) {
+                                        ui.painter().image(
+                                            t.id(),
+                                            rect.shrink(4.0),
+                                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                    let rr = ui.add(egui::Label::new(&e.name).sense(Sense::click()));
+                                    r.clicked() || rr.clicked()
+                                })
+                                .inner;
+                            if clicked {
+                                let target = self.picker_target.take().or_else(|| self.cfg.tiles.iter().position(Option::is_none));
+                                if let Some(i) = target {
+                                    self.cfg.tiles[i] = Some(e.id);
+                                    self.status = save_layout(&self.layout_path, &self.cfg)
+                                        .map(|_| "saved layout".into())
+                                        .unwrap_or_else(|x| x);
+                                    if self.status != "saved layout" {
+                                        eprintln!("{}", self.status);
+                                    }
                                 } else {
                                     self.status = "no empty tile".into();
                                 }
@@ -255,54 +501,80 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let w = self.cfg.width.max(1);
-            let h = self.cfg.height.max(1);
             self.cfg.tiles.resize(w * h, None);
+            let mut drop_target = None;
+            let mut changed = false;
+            ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
             for y in 0..h {
                 ui.horizontal(|ui| {
                     for x in 0..w {
                         let i = y * w + x;
-                        let txt = self.cfg.tiles[i]
-                            .as_ref()
-                            .and_then(|id| self.all_entries.get(id))
-                            .map(|e| format!("{}{}", e.icon.clone().unwrap_or_default(), if e.icon.is_some() { " " } else { "" }) + &e.name)
-                            .unwrap_or_else(|| " ".into());
-                        let r = ui.add(Button::new(txt).min_size(egui::vec2(130.0, 70.0)).sense(Sense::click_and_drag()));
+                        let (rect, r) = ui.allocate_exact_size(egui::vec2(tile, tile), Sense::click_and_drag());
+                        let fill = ui.style().visuals.widgets.inactive.bg_fill;
+                        ui.painter().rect_filled(rect, 8.0, fill);
+                        if let Some(e) = self.cfg.tiles[i].as_ref().and_then(|id| self.all_entries.get(id)).cloned() {
+                            if let Some(t) = self.icon_for_entry(ctx, &e) {
+                                ui.painter().image(
+                                    t.id(),
+                                    rect.shrink(8.0),
+                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
                         if r.drag_started() {
                             self.drag_from = Some(i);
                         }
-                        if self.drag_from.is_some() && r.hovered() && ui.input(|inp| inp.pointer.any_released()) {
-                            let from = self.drag_from.unwrap_or(i);
-                            self.cfg.tiles.swap(from, i);
-                            self.drag_from = None;
-                            self.status = save_config(&self.cfg_path, &self.cfg).map(|_| "moved".into()).unwrap_or_else(|e| e);
+                        if r.hovered() {
+                            drop_target = Some(i);
                         }
                         if r.clicked() && self.drag_from.is_none() {
                             if let Some(id) = &self.cfg.tiles[i] {
                                 if let Some(e) = self.all_entries.get(id) {
                                     self.status = run_shell(&clean_exec(&e.exec)).map(|_| format!("launched {}", e.name)).unwrap_or_else(|e| e);
+                                    if self.status.starts_with("launched ") {
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    }
                                 }
+                            } else {
+                                self.picker_target = Some(i);
+                                self.picker_open = true;
                             }
                         }
                         if r.secondary_clicked() {
                             self.cfg.tiles[i] = None;
-                            self.status = save_config(&self.cfg_path, &self.cfg).map(|_| "removed".into()).unwrap_or_else(|e| e);
+                            changed = true;
                         }
                     }
                 });
+                if y + 1 < h && gap > 0.0 {
+                    ui.add_space(gap);
+                }
+            }
+            if ctx.input(|inp| inp.pointer.button_released(egui::PointerButton::Primary)) {
+                if let (Some(from), Some(to)) = (self.drag_from.take(), drop_target) {
+                    self.cfg.tiles.swap(from, to);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.status = save_layout(&self.layout_path, &self.cfg)
+                    .map(|_| "saved layout".into())
+                    .unwrap_or_else(|x| x);
+                if self.status != "saved layout" {
+                    eprintln!("{}", self.status);
+                }
             }
         });
 
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("bottom").exact_height(bar_h + bottom_gap).show(ctx, |ui| {
+            if bottom_gap > 0.0 {
+                ui.add_space(bottom_gap);
+            }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                for line in self.cfg.bottom_bar.options.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                    if ui.button(line).clicked() {
-                        let label = option_label(line);
-                        if let Some(cmd) = self.cfg.bottom_bar.commands.get(&label) {
-                            self.status = run_shell(cmd).map(|_| format!("ran {label}")).unwrap_or_else(|e| e);
-                        } else {
-                            self.status = format!("missing command for {label}");
-                        }
+                for (label, cmd) in parse_power_pairs(&self.cfg.bottom_bar.options, &self.cfg.bottom_bar.commands) {
+                    if ui.button(&label).clicked() {
+                        self.status = run_shell(&cmd).map(|_| format!("ran {label}")).unwrap_or_else(|e| e);
                     }
                 }
             });
@@ -311,6 +583,22 @@ impl eframe::App for App {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    let native = eframe::NativeOptions::default();
+    let (cfg, _) = ensure_config(&config_path());
+    let w = cfg.width.max(1);
+    let h = cfg.height.max(1);
+    let tile = cfg.icon_size.clamp(40.0, 220.0);
+    let gap = cfg.tile_gap.clamp(0.0, 24.0);
+    let bottom_gap = cfg.bottom_gap.clamp(0.0, 24.0);
+    let bar_h = 38.0;
+    let native = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([
+                w as f32 * tile + (w.saturating_sub(1) as f32 * gap) + 16.0,
+                h as f32 * tile + (h.saturating_sub(1) as f32 * gap) + bottom_gap + bar_h + 14.0,
+            ])
+            .with_resizable(false)
+            .with_transparent(true),
+        ..Default::default()
+    };
     eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new()))))
 }

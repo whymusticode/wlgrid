@@ -33,6 +33,7 @@ struct Config {
     width: usize,
     height: usize,
     opacity: f32,
+    window_transparent: bool,
     mode: String,
     alpha: f32,
     icon_size: f32,
@@ -106,6 +107,7 @@ impl Default for Config {
             width: 6,
             height: 4,
             opacity: 0.9,
+            window_transparent: false,
             mode: "grid".into(),
             alpha: 0.08,
             icon_size: 96.0,
@@ -652,7 +654,7 @@ impl eframe::App for App {
     }
 }
 
-fn native_options_from_cfg(cfg: &Config, transparent: bool) -> eframe::NativeOptions {
+fn native_options_from_cfg(cfg: &Config) -> eframe::NativeOptions {
     let w = cfg.width.max(1);
     let h = cfg.height.max(1);
     let tile = cfg.icon_size.clamp(40.0, 220.0);
@@ -666,7 +668,7 @@ fn native_options_from_cfg(cfg: &Config, transparent: bool) -> eframe::NativeOpt
                 h as f32 * tile + (h.saturating_sub(1) as f32 * gap) + bottom_gap + bar_h + 14.0,
             ])
             .with_resizable(false)
-            .with_transparent(transparent),
+            .with_transparent(cfg.window_transparent),
         ..Default::default()
     }
 }
@@ -686,8 +688,8 @@ fn backend_debug_snapshot() -> String {
         .join(" | ")
 }
 
-fn run_app(cfg: &Config, transparent: bool) -> Result<(), eframe::Error> {
-    let native = native_options_from_cfg(cfg, transparent);
+fn run_app(cfg: &Config) -> Result<(), eframe::Error> {
+    let native = native_options_from_cfg(cfg);
     eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new()))))
 }
 
@@ -707,12 +709,8 @@ fn main() -> Result<(), eframe::Error> {
         unsafe { env::remove_var("WAYLAND_DISPLAY") };
         eprintln!("wlgrid preflight env: {}", backend_debug_snapshot());
     }
-    let backend = env::var("WINIT_UNIX_BACKEND").unwrap_or_default().to_ascii_lowercase();
-    let transparent = backend != "x11";
-    if !transparent {
-        eprintln!("wlgrid: disabling transparent window on X11 backend");
-    }
-    match run_app(&cfg, transparent) {
+    eprintln!("wlgrid transparency requested: {}", cfg.window_transparent);
+    match run_app(&cfg) {
         Ok(()) => Ok(()),
         Err(e) => {
             eprintln!("wlgrid startup error: {}", e);

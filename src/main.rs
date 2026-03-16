@@ -670,18 +670,47 @@ fn native_options_from_cfg(cfg: &Config) -> eframe::NativeOptions {
     }
 }
 
+fn backend_debug_snapshot() -> String {
+    let vars = [
+        "XDG_SESSION_TYPE",
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "WINIT_UNIX_BACKEND",
+        "XDG_CURRENT_DESKTOP",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+    ];
+    vars.into_iter()
+        .map(|k| format!("{k}={}", env::var(k).unwrap_or_else(|_| "<unset>".into())))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn run_app(cfg: &Config) -> Result<(), eframe::Error> {
+    let native = native_options_from_cfg(cfg);
+    eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new()))))
+}
+
 fn main() -> Result<(), eframe::Error> {
     let (cfg, _) = ensure_config(&config_path());
-    let native = native_options_from_cfg(&cfg);
-    match eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new())))) {
+    eprintln!("wlgrid startup env: {}", backend_debug_snapshot());
+    match run_app(&cfg) {
         Ok(()) => Ok(()),
         Err(e) => {
             let msg = e.to_string();
+            eprintln!("wlgrid first backend error: {msg}");
             if msg.contains("NoWaylandLib") {
-                eprintln!("Wayland backend unavailable, retrying with X11 backend");
+                eprintln!("Wayland backend unavailable, forcing X11 fallback");
                 unsafe { env::set_var("WINIT_UNIX_BACKEND", "x11") };
-                let native = native_options_from_cfg(&cfg);
-                eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new()))))
+                unsafe { env::set_var("XDG_SESSION_TYPE", "x11") };
+                unsafe { env::remove_var("WAYLAND_DISPLAY") };
+                eprintln!("wlgrid retry env: {}", backend_debug_snapshot());
+                match run_app(&cfg) {
+                    Ok(()) => Ok(()),
+                    Err(e2) => {
+                        eprintln!("wlgrid x11 retry error: {}", e2);
+                        Err(e2)
+                    }
+                }
             } else {
                 Err(e)
             }

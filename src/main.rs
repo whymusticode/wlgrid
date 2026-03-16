@@ -32,6 +32,8 @@ struct Config {
     width: usize,
     height: usize,
     opacity: f32,
+    mode: String,
+    alpha: f32,
     icon_size: f32,
     tile_gap: f32,
     bottom_gap: f32,
@@ -44,6 +46,8 @@ struct Config {
 #[derive(Serialize, Deserialize, Default)]
 struct TileLayout {
     tiles: Vec<String>,
+    #[serde(default)]
+    scores: HashMap<String, f32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -54,6 +58,7 @@ struct LegacyTileLayout {
 struct App {
     cfg: Config,
     layout_path: PathBuf,
+    scores: HashMap<String, f32>,
     all_entries: HashMap<String, Entry>,
     icon_index: HashMap<String, PathBuf>,
     textures: HashMap<String, egui::TextureHandle>,
@@ -100,6 +105,8 @@ impl Default for Config {
             width: 6,
             height: 4,
             opacity: 0.9,
+            mode: "grid".into(),
+            alpha: 0.08,
             icon_size: 96.0,
             tile_gap: 8.0,
             bottom_gap: 6.0,
@@ -119,6 +126,7 @@ fn ensure_config(path: &Path) -> (Config, String) {
             let len = cfg.width.saturating_mul(cfg.height);
             cfg.tiles.resize(len, None);
             cfg.opacity = cfg.opacity.clamp(0.15, 1.0);
+            cfg.alpha = cfg.alpha.clamp(0.0, 1.0);
             cfg.icon_size = cfg.icon_size.clamp(40.0, 220.0);
             cfg.tile_gap = cfg.tile_gap.clamp(0.0, 24.0);
             cfg.bottom_gap = cfg.bottom_gap.clamp(0.0, 24.0);
@@ -129,7 +137,7 @@ fn ensure_config(path: &Path) -> (Config, String) {
     (default_config(), String::new())
 }
 
-fn load_layout(path: &Path, cfg: &mut Config) -> Result<(), String> {
+fn load_layout(path: &Path, cfg: &mut Config, scores: &mut HashMap<String, f32>) -> Result<(), String> {
     if let Ok(text) = fs::read_to_string(path) {
         if text.trim().is_empty() {
             return Ok(());
@@ -142,11 +150,13 @@ fn load_layout(path: &Path, cfg: &mut Config) -> Result<(), String> {
                     .map(|t| if t.trim().is_empty() { None } else { Some(t) })
                     .collect();
                 cfg.tiles.resize(cfg.width.saturating_mul(cfg.height), None);
+                *scores = layout.scores;
             }
             Err(e1) => match toml::from_str::<LegacyTileLayout>(&text) {
                 Ok(layout) => {
                     cfg.tiles = layout.tiles;
                     cfg.tiles.resize(cfg.width.saturating_mul(cfg.height), None);
+                    scores.clear();
                 }
                 Err(_) => {
                     let ts = SystemTime::now()
@@ -163,12 +173,13 @@ fn load_layout(path: &Path, cfg: &mut Config) -> Result<(), String> {
     Ok(())
 }
 
-fn save_layout(path: &Path, cfg: &Config) -> Result<(), String> {
+fn save_layout(path: &Path, cfg: &Config, scores: &HashMap<String, f32>) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let data = TileLayout {
         tiles: cfg.tiles.iter().map(|t| t.clone().unwrap_or_default()).collect(),
+        scores: scores.clone(),
     };
     atomic_write(path, toml::to_string_pretty(&data).map_err(|e| e.to_string())?.as_bytes())
 }
@@ -372,7 +383,8 @@ impl App {
         let cfg_path = config_path();
         let layout_path = layout_path();
         let (mut cfg, cfg_status) = ensure_config(&cfg_path);
-        let layout_status = load_layout(&layout_path, &mut cfg).err().unwrap_or_default();
+        let mut scores = HashMap::new();
+        let layout_status = load_layout(&layout_path, &mut cfg, &mut scores).err().unwrap_or_default();
         let status = match (cfg_status.is_empty(), layout_status.is_empty()) {
             (true, true) => String::new(),
             (false, true) => cfg_status,
@@ -387,6 +399,7 @@ impl App {
         Self {
             cfg,
             layout_path,
+            scores,
             all_entries,
             icon_index,
             textures: HashMap::new(),
@@ -418,11 +431,29 @@ impl App {
             None
         }
     }
+
+    fn launch_entry(&mut self, ctx: &egui::Context, id: &str) {
+        if let Some(e) = self.all_entries.get(id).cloned() {
+            self.status = run_shell(&clean_exec(&e.exec)).map(|_| format!("launched {}", e.name)).unwrap_or_else(|x| x);
+            if self.status.starts_with("launched ") {
+                let decay = (1.0 - self.cfg.alpha.clamp(0.0, 1.0)).max(0.0);
+                for v in self.scores.values_mut() {
+                    *v *= decay;
+                }
+                *self.scores.entry(id.to_string()).or_insert(0.0) += 1.0;
+                self.scores.retain(|_, v| *v > 0.0001);
+                if let Err(e) = save_layout(&self.layout_path, &self.cfg, &self.scores) {
+                    self.status = e;
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = save_layout(&self.layout_path, &self.cfg);
+        let _ = save_layout(&self.layout_path, &self.cfg, &self.scores);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -483,7 +514,7 @@ impl eframe::App for App {
                                 let target = self.picker_target.take().or_else(|| self.cfg.tiles.iter().position(Option::is_none));
                                 if let Some(i) = target {
                                     self.cfg.tiles[i] = Some(e.id);
-                                    self.status = save_layout(&self.layout_path, &self.cfg)
+                                    self.status = save_layout(&self.layout_path, &self.cfg, &self.scores)
                                         .map(|_| "saved layout".into())
                                         .unwrap_or_else(|x| x);
                                     if self.status != "saved layout" {
@@ -501,6 +532,48 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.cfg.mode.eq_ignore_ascii_case("fuzzel") {
+                let mut ids = self.all_entries.keys().cloned().collect::<Vec<_>>();
+                ids.sort_by(|a, b| {
+                    let sa = self.scores.get(a).copied().unwrap_or(0.0);
+                    let sb = self.scores.get(b).copied().unwrap_or(0.0);
+                    sb.total_cmp(&sa).then_with(|| a.cmp(b))
+                });
+                let cols = w.max(1);
+                ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+                let mut idx = 0usize;
+                while idx < ids.len() {
+                    ui.horizontal(|ui| {
+                        for _ in 0..cols {
+                            if idx >= ids.len() {
+                                break;
+                            }
+                            let id = ids[idx].clone();
+                            idx += 1;
+                            let (rect, r) = ui.allocate_exact_size(egui::vec2(tile, tile), Sense::click());
+                            let fill = ui.style().visuals.widgets.inactive.bg_fill;
+                            ui.painter().rect_filled(rect, 8.0, fill);
+                            if let Some(e) = self.all_entries.get(&id).cloned() {
+                                if let Some(t) = self.icon_for_entry(ctx, &e) {
+                                    ui.painter().image(
+                                        t.id(),
+                                        rect.shrink(8.0),
+                                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            }
+                            if r.clicked() {
+                                self.launch_entry(ctx, &id);
+                            }
+                        }
+                    });
+                    if idx < ids.len() && gap > 0.0 {
+                        ui.add_space(gap);
+                    }
+                }
+                return;
+            }
             self.cfg.tiles.resize(w * h, None);
             let mut drop_target = None;
             let mut changed = false;
@@ -530,12 +603,8 @@ impl eframe::App for App {
                         }
                         if r.clicked() && self.drag_from.is_none() {
                             if let Some(id) = &self.cfg.tiles[i] {
-                                if let Some(e) = self.all_entries.get(id) {
-                                    self.status = run_shell(&clean_exec(&e.exec)).map(|_| format!("launched {}", e.name)).unwrap_or_else(|e| e);
-                                    if self.status.starts_with("launched ") {
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                    }
-                                }
+                                let id = id.clone();
+                                self.launch_entry(ctx, &id);
                             } else {
                                 self.picker_target = Some(i);
                                 self.picker_open = true;
@@ -558,7 +627,7 @@ impl eframe::App for App {
                 }
             }
             if changed {
-                self.status = save_layout(&self.layout_path, &self.cfg)
+                self.status = save_layout(&self.layout_path, &self.cfg, &self.scores)
                     .map(|_| "saved layout".into())
                     .unwrap_or_else(|x| x);
                 if self.status != "saved layout" {
@@ -582,15 +651,14 @@ impl eframe::App for App {
     }
 }
 
-fn main() -> Result<(), eframe::Error> {
-    let (cfg, _) = ensure_config(&config_path());
+fn native_options_from_cfg(cfg: &Config) -> eframe::NativeOptions {
     let w = cfg.width.max(1);
     let h = cfg.height.max(1);
     let tile = cfg.icon_size.clamp(40.0, 220.0);
     let gap = cfg.tile_gap.clamp(0.0, 24.0);
     let bottom_gap = cfg.bottom_gap.clamp(0.0, 24.0);
     let bar_h = 38.0;
-    let native = eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([
                 w as f32 * tile + (w.saturating_sub(1) as f32 * gap) + 16.0,
@@ -599,6 +667,24 @@ fn main() -> Result<(), eframe::Error> {
             .with_resizable(false)
             .with_transparent(true),
         ..Default::default()
-    };
-    eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new()))))
+    }
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let (cfg, _) = ensure_config(&config_path());
+    let native = native_options_from_cfg(&cfg);
+    match eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new())))) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("NoWaylandLib") {
+                eprintln!("Wayland backend unavailable, retrying with X11 backend");
+                unsafe { env::set_var("WINIT_UNIX_BACKEND", "x11") };
+                let native = native_options_from_cfg(&cfg);
+                eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new()))))
+            } else {
+                Err(e)
+            }
+        }
+    }
 }

@@ -1,4 +1,5 @@
 use eframe::egui::{self, Align, Layout, Sense};
+use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -690,34 +691,27 @@ fn run_app(cfg: &Config) -> Result<(), eframe::Error> {
     eframe::run_native("wlgrid", native, Box::new(|_| Ok(Box::new(App::new()))))
 }
 
+fn wayland_lib_available() -> bool {
+    unsafe { Library::new("libwayland-client.so.0").is_ok() || Library::new("libwayland-client.so").is_ok() }
+}
+
 fn main() -> Result<(), eframe::Error> {
     let (cfg, _) = ensure_config(&config_path());
     eprintln!("wlgrid startup env: {}", backend_debug_snapshot());
+    let on_wayland = env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
+        || env::var("WAYLAND_DISPLAY").is_ok();
+    if on_wayland && !wayland_lib_available() {
+        eprintln!("wlgrid preflight: missing wayland client library, starting with X11 backend");
+        unsafe { env::set_var("WINIT_UNIX_BACKEND", "x11") };
+        unsafe { env::set_var("XDG_SESSION_TYPE", "x11") };
+        unsafe { env::remove_var("WAYLAND_DISPLAY") };
+        eprintln!("wlgrid preflight env: {}", backend_debug_snapshot());
+    }
     match run_app(&cfg) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let msg = e.to_string();
-            eprintln!("wlgrid first backend error: {msg}");
-            let lower = msg.to_ascii_lowercase();
-            let wayland_load_fail = msg.contains("NoWaylandLib")
-                || lower.contains("wayland library could not be loaded")
-                || (lower.contains("wayland") && lower.contains("could not be loaded"));
-            if wayland_load_fail {
-                eprintln!("Wayland backend unavailable, forcing X11 fallback");
-                unsafe { env::set_var("WINIT_UNIX_BACKEND", "x11") };
-                unsafe { env::set_var("XDG_SESSION_TYPE", "x11") };
-                unsafe { env::remove_var("WAYLAND_DISPLAY") };
-                eprintln!("wlgrid retry env: {}", backend_debug_snapshot());
-                match run_app(&cfg) {
-                    Ok(()) => Ok(()),
-                    Err(e2) => {
-                        eprintln!("wlgrid x11 retry error: {}", e2);
-                        Err(e2)
-                    }
-                }
-            } else {
-                Err(e)
-            }
+            eprintln!("wlgrid startup error: {}", e);
+            Err(e)
         }
     }
 }

@@ -698,7 +698,11 @@ fn main() -> Result<(), eframe::Error> {
         Err(e) => {
             let msg = e.to_string();
             eprintln!("wlgrid first backend error: {msg}");
-            if msg.contains("NoWaylandLib") {
+            let lower = msg.to_ascii_lowercase();
+            let wayland_load_fail = msg.contains("NoWaylandLib")
+                || lower.contains("wayland library could not be loaded")
+                || (lower.contains("wayland") && lower.contains("could not be loaded"));
+            if wayland_load_fail {
                 eprintln!("Wayland backend unavailable, forcing X11 fallback");
                 unsafe { env::set_var("WINIT_UNIX_BACKEND", "x11") };
                 unsafe { env::set_var("XDG_SESSION_TYPE", "x11") };

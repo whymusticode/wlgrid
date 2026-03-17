@@ -1,136 +1,212 @@
-use std::{env, num::NonZeroU32};
+use std::env;
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState},
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
+    output::{OutputHandler, OutputState},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
+    },
+    shell::{
+        wlr_layer::{
+            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+            LayerSurfaceConfigure,
+        },
+        WaylandSurface,
+    },
+    shm::{slot::SlotPool, Shm, ShmHandler},
+};
+use wayland_client::{
+    globals::registry_queue_init,
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    Connection, QueueHandle,
+};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // ── 1. Environment snapshot ──
-    eprintln!("=== wlgrid wayland render probe ===");
+fn main() {
+    // ── env probe ──
+    eprintln!("=== wlgrid layer-shell probe ===");
     for k in [
-        "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "WAYLAND_DISPLAY", "DISPLAY",
-        "WINIT_UNIX_BACKEND", "HYPRLAND_INSTANCE_SIGNATURE", "XDG_RUNTIME_DIR",
-        "GDK_BACKEND", "QT_QPA_PLATFORM", "SDL_VIDEODRIVER",
-        "LIBGL_ALWAYS_SOFTWARE", "WLR_RENDERER", "WLR_BACKENDS",
-        "MESA_LOADER_DRIVER_OVERRIDE", "GALLIUM_DRIVER",
-        "VK_ICD_FILENAMES", "VK_DRIVER_FILES",
-        "LIBVA_DRIVER_NAME", "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+        "HYPRLAND_INSTANCE_SIGNATURE",
     ] {
-        eprintln!("  {k} = {}", env::var(k).unwrap_or_else(|_| "<unset>".into()));
+        eprintln!("  {k} = {}", env::var(k).unwrap_or("<unset>".into()));
     }
-
-    // ── 2. Probe shared libraries ──
-    eprintln!("\n=== shared library probes ===");
-    for lib in [
-        "libwayland-client.so.0", "libwayland-client.so",
-        "libwayland-egl.so.1", "libwayland-cursor.so.0",
-        "libEGL.so.1", "libEGL.so",
-        "libGLESv2.so.2", "libGL.so.1", "libGL.so",
-        "libvulkan.so.1", "libvulkan.so",
-        "libX11.so.6", "libX11-xcb.so.1",
-        "libxcb.so.1", "libxkbcommon.so.0",
-        "libdrm.so.2", "libgbm.so.1",
-    ] {
+    for lib in ["libwayland-client.so.0", "libwayland-egl.so.1", "libxkbcommon.so.0"] {
         let ok = unsafe { libloading::Library::new(lib).is_ok() };
         eprintln!("  {lib:36} {}", if ok { "OK" } else { "MISSING" });
     }
 
-    // ── 3. Check XDG_RUNTIME_DIR/wayland socket ──
-    eprintln!("\n=== wayland socket ===");
-    if let (Ok(rd), Ok(wd)) = (env::var("XDG_RUNTIME_DIR"), env::var("WAYLAND_DISPLAY")) {
-        let sock = std::path::PathBuf::from(&rd).join(&wd);
-        eprintln!("  socket path: {}", sock.display());
-        eprintln!("  exists: {}", sock.exists());
-        if sock.exists() {
-            if let Ok(m) = std::fs::metadata(&sock) {
-                eprintln!("  file_type: {:?}  len: {}", m.file_type(), m.len());
-            }
-        }
-    } else {
-        eprintln!("  XDG_RUNTIME_DIR or WAYLAND_DISPLAY not set");
+    // ── connect to wayland ──
+    let conn = Connection::connect_to_env().unwrap();
+    let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
+    let qh = event_queue.handle();
+    eprintln!("  wayland connection OK");
+
+    let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
+    let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell missing");
+    let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
+    eprintln!("  compositor + layer_shell + shm bound");
+
+    // ── create layer surface (overlay, exclusive keyboard, centered 600x400) ──
+    let surface = compositor.create_surface(&qh);
+    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("wlgrid"), None);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    layer.set_size(600, 400);
+    layer.commit();
+    eprintln!("  layer surface committed, waiting for configure...");
+
+    let pool = SlotPool::new(600 * 400 * 4, &shm).expect("pool alloc failed");
+
+    let mut app = App {
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state: OutputState::new(&globals, &qh),
+        shm,
+        exit: false,
+        first_configure: true,
+        pool,
+        width: 600,
+        height: 400,
+        layer,
+        keyboard: None,
+        pointer: None,
+    };
+
+    loop {
+        event_queue.blocking_dispatch(&mut app).unwrap();
+        if app.exit { break; }
     }
+    eprintln!("  exiting");
+}
 
-    // ── 4. Wayland fallback logic ──
-    let on_wayland = env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
-        || env::var("WAYLAND_DISPLAY").is_ok();
-    let wl_lib = unsafe {
-        libloading::Library::new("libwayland-client.so.0").is_ok()
-            || libloading::Library::new("libwayland-client.so").is_ok()
-    };
-    eprintln!("\n=== backend decision ===");
-    eprintln!("  on_wayland={on_wayland}  wl_lib_loadable={wl_lib}");
-    if on_wayland && !wl_lib {
-        eprintln!("  -> forcing X11 backend (XWayland)");
-        unsafe {
-            env::set_var("WINIT_UNIX_BACKEND", "x11");
-            env::set_var("XDG_SESSION_TYPE", "x11");
-            env::remove_var("WAYLAND_DISPLAY");
+struct App {
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
+    shm: Shm,
+    exit: bool,
+    first_configure: bool,
+    pool: SlotPool,
+    width: u32,
+    height: u32,
+    layer: LayerSurface,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+}
+
+impl App {
+    fn draw(&mut self, qh: &QueueHandle<Self>) {
+        let (w, h) = (self.width, self.height);
+        let stride = w as i32 * 4;
+        let (buffer, canvas) = self.pool
+            .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+            .expect("create buffer");
+
+        canvas.chunks_exact_mut(4).enumerate().for_each(|(i, chunk)| {
+            let (x, y) = ((i as u32 % w), (i as u32 / w));
+            let r = ((w - x) * 0xFF / w).min(((h - y) * 0xFF) / h);
+            let g = (x * 0xFF / w).min(((h - y) * 0xFF) / h);
+            let b = ((w - x) * 0xFF / w).min((y * 0xFF) / h);
+            let color = (0xFF << 24) | (r << 16) | (g << 8) | b;
+            chunk.copy_from_slice(&color.to_le_bytes());
+        });
+
+        self.layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
+        self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
+        buffer.attach_to(self.layer.wl_surface()).expect("buffer attach");
+        self.layer.commit();
+    }
+}
+
+// ── handler impls (mostly stubs) ──
+
+impl CompositorHandler for App {
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
+    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) { self.draw(qh); }
+    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+}
+
+impl OutputHandler for App {
+    fn output_state(&mut self) -> &mut OutputState { &mut self.output_state }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+}
+
+impl LayerShellHandler for App {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) { self.exit = true; }
+    fn configure(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
+        if cfg.new_size.0 != 0 { self.width = cfg.new_size.0; }
+        if cfg.new_size.1 != 0 { self.height = cfg.new_size.1; }
+        if self.first_configure {
+            self.first_configure = false;
+            eprintln!("  configured {}x{}, drawing first frame", self.width, self.height);
+            self.draw(qh);
         }
     }
+}
 
-    // ── 5. Try winit EventLoop ──
-    eprintln!("\n=== creating EventLoop ===");
-    let event_loop = match winit::event_loop::EventLoop::builder().build() {
-        Ok(el) => { eprintln!("  EventLoop created OK"); el }
-        Err(e) => { eprintln!("  EventLoop FAILED: {e}"); return Err(e.into()); }
-    };
-
-    // ── 6. Try softbuffer Context ──
-    eprintln!("=== creating softbuffer::Context ===");
-    let context = match softbuffer::Context::new(event_loop.owned_display_handle()) {
-        Ok(c) => { eprintln!("  Context created OK"); c }
-        Err(e) => { eprintln!("  Context FAILED: {e}"); return Err(e.into()); }
-    };
-
-    // ── 7. Run event loop (with ControlFlow::Wait to avoid busy-spin) ──
-    eprintln!("=== entering event loop ===\n");
-    let mut surface = None::<softbuffer::Surface<_, _>>;
-
-    #[allow(deprecated)]
-    event_loop.run(move |ev, elwt| {
-        elwt.set_control_flow(winit::event_loop::ControlFlow::Wait);
-
-        if surface.is_none() {
-            eprintln!("  creating window...");
-            let w = elwt.create_window(
-                winit::window::WindowAttributes::default()
-                    .with_title("wlgrid probe")
-                    .with_inner_size(winit::dpi::LogicalSize::new(400.0, 300.0)),
-            ).unwrap();
-            let sz = w.inner_size();
-            eprintln!("  window created {}x{}", sz.width, sz.height);
-            let mut s = softbuffer::Surface::new(&context, w).unwrap();
-            eprintln!("  surface created OK");
-            if let (Some(w), Some(h)) = (NonZeroU32::new(sz.width), NonZeroU32::new(sz.height)) {
-                let _ = s.resize(w, h);
-            }
-            s.window().request_redraw();
-            surface = Some(s);
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState { &mut self.seat_state }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Keyboard && self.keyboard.is_none() {
+            self.keyboard = Some(self.seat_state.get_keyboard(qh, &seat, None).expect("keyboard"));
         }
+        if cap == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = Some(self.seat_state.get_pointer(qh, &seat).expect("pointer"));
+        }
+    }
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Keyboard { self.keyboard.take().map(|k| k.release()); }
+        if cap == Capability::Pointer { self.pointer.take().map(|p| p.release()); }
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
 
-        let s = surface.as_mut().unwrap();
-        if let winit::event::Event::WindowEvent { window_id, event } = ev {
-            if window_id != s.window().id() { return; }
-            match event {
-                winit::event::WindowEvent::Resized(sz) => {
-                    if let (Some(w), Some(h)) = (NonZeroU32::new(sz.width), NonZeroU32::new(sz.height)) {
-                        let _ = s.resize(w, h);
-                    }
-                }
-                winit::event::WindowEvent::RedrawRequested => {
-                    if let Ok(mut buf) = s.buffer_mut() {
-                        let w = buf.width().get() as usize;
-                        for (i, p) in buf.iter_mut().enumerate() {
-                            let (x, y) = ((i % w) as u32, (i / w) as u32);
-                            *p = (x % 256) << 16 | (y % 256) << 8 | 180;
-                        }
-                        if let Err(e) = buf.present() {
-                            eprintln!("  present error: {e}");
-                        } else {
-                            eprintln!("  frame presented OK");
-                        }
-                    }
-                }
-                winit::event::WindowEvent::CloseRequested => elwt.exit(),
+impl KeyboardHandler for App {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
+    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+        eprintln!("  key: {:?}", event.keysym);
+        if event.keysym == Keysym::Escape { self.exit = true; }
+    }
+    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
+    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: Modifiers, _: u32) {}
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        for ev in events {
+            if &ev.surface != self.layer.wl_surface() { continue; }
+            match ev.kind {
+                PointerEventKind::Press { button, .. } => eprintln!("  click {button:#x} @ {:?}", ev.position),
                 _ => {}
             }
         }
-    })?;
-    Ok(())
+    }
+}
+
+impl ShmHandler for App {
+    fn shm_state(&mut self) -> &mut Shm { &mut self.shm }
+}
+
+delegate_compositor!(App);
+delegate_output!(App);
+delegate_shm!(App);
+delegate_seat!(App);
+delegate_keyboard!(App);
+delegate_pointer!(App);
+delegate_layer!(App);
+delegate_registry!(App);
+
+impl ProvidesRegistryState for App {
+    fn registry(&mut self) -> &mut RegistryState { &mut self.registry_state }
+    registry_handlers![OutputState, SeatState];
 }

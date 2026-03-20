@@ -1,0 +1,1576 @@
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
+use std::io::Write;
+use image::GenericImageView;
+use serde::{Deserialize, Serialize};
+use fontdue::{Font, FontSettings};
+
+// ── config ──
+
+#[derive(Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    width: Option<usize>,
+    #[serde(default)]
+    height: Option<usize>,
+    #[serde(default)]
+    icon_size: Option<f32>,
+    #[serde(default)]
+    bottom_bar: Option<BottomBar>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+struct BottomBar {
+    #[serde(default)]
+    options: String,
+}
+
+#[derive(Clone)]
+struct BarItem {
+    name: String,
+    exec: String,
+}
+
+fn parse_bottom_bar_options(options: &str) -> Vec<BarItem> {
+    options
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() { return None; }
+            let (name, exec) = line.split_once('=')?;
+            Some(BarItem {
+                name: name.trim().to_string(),
+                exec: exec.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn load_config() -> Config {
+    let config_paths = [
+        env::var("HOME").ok().map(|h| format!("{h}/.config/wlgrid/config.toml")),
+        Some("/etc/wlgrid/config.toml".to_string()),
+    ];
+
+    for path in config_paths.into_iter().flatten() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            match toml::from_str(&content) {
+                Ok(config) => {
+                    eprintln!("  loaded config from {}", path);
+                    return config;
+                }
+                Err(e) => eprintln!("  config parse error in {}: {}", path, e),
+            }
+        }
+    }
+
+    eprintln!("  no config found, using defaults");
+    Config::default()
+}
+
+// ── state persistence ──
+
+#[derive(Serialize, Deserialize, Default)]
+struct AppState {
+    /// Maps tile index to desktop entry name (for matching on reload)
+    tiles: Vec<Option<String>>,
+}
+
+fn state_path() -> Option<PathBuf> {
+    env::var("HOME").ok().map(|h| PathBuf::from(format!("{h}/.config/wlgrid/state.json")))
+}
+
+fn load_state() -> AppState {
+    if let Some(path) = state_path() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(state) = serde_json::from_str(&content) {
+                eprintln!("  loaded state from {}", path.display());
+                return state;
+            }
+        }
+    }
+    eprintln!("  no saved state, starting fresh");
+    AppState::default()
+}
+
+fn save_state(tiles: &[Option<usize>], icons: &[Icon]) {
+    let state = AppState {
+        tiles: tiles.iter().map(|opt| {
+            opt.and_then(|idx| icons.get(idx).map(|i| i.name.clone()))
+        }).collect(),
+    };
+
+    if let Some(path) = state_path() {
+        // Ensure directory exists
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::File::create(&path) {
+            Ok(mut file) => {
+                if let Ok(json) = serde_json::to_string_pretty(&state) {
+                    let _ = file.write_all(json.as_bytes());
+                    eprintln!("  saved state to {}", path.display());
+                }
+            }
+            Err(e) => eprintln!("  failed to save state: {}", e),
+        }
+    }
+}
+
+// ── binary cache for fast startup ──
+
+const CACHE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct Cache {
+    version: u32,
+    checksum: u64,
+    icons: Vec<CachedIcon>,
+    text_font_path: Option<String>,
+    symbols_font_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedIcon {
+    name: String,
+    exec: String,
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+fn cache_path() -> Option<PathBuf> {
+    env::var("HOME").ok().map(|h| PathBuf::from(format!("{h}/.config/wlgrid/cache.bin")))
+}
+
+fn compute_checksum() -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+
+    // Hash mtimes of application directories
+    let app_dirs = [
+        "/usr/share/applications",
+        "/run/current-system/sw/share/applications",
+    ];
+
+    for dir in app_dirs {
+        if let Ok(meta) = std::fs::metadata(dir) {
+            if let Ok(mtime) = meta.modified() {
+                mtime.hash(&mut hasher);
+            }
+        }
+    }
+
+    // Hash user applications dir
+    if let Ok(home) = env::var("HOME") {
+        let user_apps = format!("{home}/.local/share/applications");
+        if let Ok(meta) = std::fs::metadata(&user_apps) {
+            if let Ok(mtime) = meta.modified() {
+                mtime.hash(&mut hasher);
+            }
+        }
+    }
+
+    // Hash config.toml mtime
+    if let Ok(home) = env::var("HOME") {
+        let config_path = format!("{home}/.config/wlgrid/config.toml");
+        if let Ok(meta) = std::fs::metadata(&config_path) {
+            if let Ok(mtime) = meta.modified() {
+                mtime.hash(&mut hasher);
+            }
+        }
+    }
+
+    // Include cache version
+    CACHE_VERSION.hash(&mut hasher);
+
+    hasher.finish()
+}
+
+fn load_cache() -> Option<Cache> {
+    let path = cache_path()?;
+    let data = std::fs::read(&path).ok()?;
+    let cache: Cache = bincode::deserialize(&data).ok()?;
+
+    // Verify version and checksum
+    if cache.version != CACHE_VERSION {
+        eprintln!("  cache: version mismatch");
+        return None;
+    }
+
+    let expected_checksum = compute_checksum();
+    if cache.checksum != expected_checksum {
+        eprintln!("  cache: checksum mismatch");
+        return None;
+    }
+
+    eprintln!("  cache: valid, loading {} icons", cache.icons.len());
+    Some(cache)
+}
+
+fn save_cache(icons: &[Icon], text_font_path: Option<&Path>, symbols_font_path: Option<&Path>) {
+    let cache = Cache {
+        version: CACHE_VERSION,
+        checksum: compute_checksum(),
+        icons: icons.iter().map(|i| CachedIcon {
+            name: i.name.clone(),
+            exec: i.exec.clone(),
+            pixels: i.pixels.clone(),
+            width: i.width,
+            height: i.height,
+        }).collect(),
+        text_font_path: text_font_path.map(|p| p.to_string_lossy().into_owned()),
+        symbols_font_path: symbols_font_path.map(|p| p.to_string_lossy().into_owned()),
+    };
+
+    if let Some(path) = cache_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = bincode::serialize(&cache) {
+            if std::fs::write(&path, &data).is_ok() {
+                eprintln!("  cache: saved {} icons ({} bytes)", cache.icons.len(), data.len());
+            }
+        }
+    }
+}
+
+// ── text rendering ──
+
+struct Fonts {
+    text: Font,
+    symbols: Option<Font>,
+}
+
+struct FontsWithPaths {
+    fonts: Fonts,
+    text_path: PathBuf,
+    symbols_path: Option<PathBuf>,
+}
+
+fn is_nerd_symbol(c: char) -> bool {
+    let cp = c as u32;
+    // Nerd font symbol ranges (Private Use Areas)
+    (0xE000..=0xF8FF).contains(&cp) ||      // Basic PUA
+    (0xF0000..=0xFFFFD).contains(&cp) ||    // Supplementary PUA-A
+    (0x100000..=0x10FFFD).contains(&cp) ||  // Supplementary PUA-B
+    (0x23FB..=0x23FE).contains(&cp) ||      // Power symbols
+    (0x2B58..=0x2B58).contains(&cp) ||      // Heavy circle
+    (0xF500..=0xFD46).contains(&cp)         // More nerd icons
+}
+
+/// Load fonts from cached paths (fast path)
+fn load_fonts_from_paths(text_path: &str, symbols_path: Option<&str>) -> Option<Fonts> {
+    let text_bytes = std::fs::read(text_path).ok()?;
+    let text_font = Font::from_bytes(text_bytes, FontSettings::default()).ok()?;
+    eprintln!("  cache: loaded text font from {}", text_path);
+
+    let symbols_font = symbols_path.and_then(|p| {
+        let bytes = std::fs::read(p).ok()?;
+        let font = Font::from_bytes(bytes, FontSettings::default()).ok()?;
+        eprintln!("  cache: loaded symbols font from {}", p);
+        Some(font)
+    });
+
+    Some(Fonts { text: text_font, symbols: symbols_font })
+}
+
+/// Search for fonts (slow path, used when cache is invalid)
+fn load_fonts_with_search() -> Option<FontsWithPaths> {
+    // Common font directories on Linux/NixOS
+    let font_dirs = [
+        "/run/current-system/sw/share/X11/fonts",
+        "/run/current-system/sw/share/fonts",
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+    ];
+
+    // Also check user font dirs
+    let home = env::var("HOME").ok();
+    let user_font_dirs: Vec<String> = home.iter().flat_map(|h| [
+        format!("{h}/.local/share/fonts"),
+        format!("{h}/.fonts"),
+    ]).collect();
+
+    let all_dirs: Vec<&str> = font_dirs.iter().copied()
+        .chain(user_font_dirs.iter().map(|s| s.as_str()))
+        .collect();
+
+    // Collect all TTF files
+    let mut all_fonts: Vec<PathBuf> = Vec::new();
+    for dir in &all_dirs {
+        for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "ttf" || e == "otf") {
+                all_fonts.push(path.to_path_buf());
+            }
+        }
+    }
+    eprintln!("  found {} font files", all_fonts.len());
+
+    // Find text font (prefer DejaVu, Liberation, or any sans)
+    let text_patterns = ["DejaVuSans", "LiberationSans", "NotoSans", "Ubuntu", "Roboto"];
+    let mut text_font = None;
+    let mut text_path = None;
+    for pattern in text_patterns {
+        for path in &all_fonts {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(pattern) && !name.contains("Nerd") && !name.contains("Bold") && !name.contains("Italic") {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                        eprintln!("  loaded text font: {}", path.display());
+                        text_font = Some(font);
+                        text_path = Some(path.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        if text_font.is_some() { break; }
+    }
+
+    // Fallback: any regular-looking font
+    if text_font.is_none() {
+        for path in &all_fonts {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.contains("Nerd") && !name.contains("Symbol") && !name.contains("Bold") && !name.contains("Italic") {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                        eprintln!("  loaded text font (fallback): {}", path.display());
+                        text_font = Some(font);
+                        text_path = Some(path.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let text_font = text_font?;
+    let text_path = text_path?;
+
+    // Find nerd symbols font
+    let mut symbols_font = None;
+    let mut symbols_path = None;
+    for path in &all_fonts {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.contains("NerdFont") && name.contains("Symbol") {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                    eprintln!("  loaded symbols font: {}", path.display());
+                    symbols_font = Some(font);
+                    symbols_path = Some(path.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    Some(FontsWithPaths {
+        fonts: Fonts { text: text_font, symbols: symbols_font },
+        text_path,
+        symbols_path,
+    })
+}
+
+fn render_text(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    fonts: &Fonts,
+    text: &str,
+    x: i32,
+    y: i32,
+    size: f32,
+    color: [u8; 4],
+) {
+    let mut cursor_x = x as f32;
+    for c in text.chars() {
+        // Choose font based on character
+        let font = if is_nerd_symbol(c) {
+            fonts.symbols.as_ref().unwrap_or(&fonts.text)
+        } else {
+            &fonts.text
+        };
+
+        let (metrics, bitmap) = font.rasterize(c, size);
+
+        let gx = cursor_x as i32 + metrics.xmin;
+        let gy = y - metrics.height as i32 - metrics.ymin;
+
+        for row in 0..metrics.height {
+            for col in 0..metrics.width {
+                let px = gx + col as i32;
+                let py = gy + row as i32;
+                if px < 0 || py < 0 || px >= canvas_w as i32 || py >= canvas_h as i32 {
+                    continue;
+                }
+
+                let alpha = bitmap[row * metrics.width + col] as u32;
+                if alpha == 0 { continue; }
+
+                let idx = ((py as u32 * canvas_w + px as u32) * 4) as usize;
+                if idx + 3 >= canvas.len() { continue; }
+
+                // Alpha blend
+                let inv_alpha = 255 - alpha;
+                canvas[idx] = ((color[0] as u32 * alpha + canvas[idx] as u32 * inv_alpha) / 255) as u8;
+                canvas[idx + 1] = ((color[1] as u32 * alpha + canvas[idx + 1] as u32 * inv_alpha) / 255) as u8;
+                canvas[idx + 2] = ((color[2] as u32 * alpha + canvas[idx + 2] as u32 * inv_alpha) / 255) as u8;
+                canvas[idx + 3] = 255;
+            }
+        }
+
+        cursor_x += metrics.advance_width;
+    }
+}
+
+fn text_width(fonts: &Fonts, text: &str, size: f32) -> f32 {
+    text.chars().map(|c| {
+        let font = if is_nerd_symbol(c) {
+            fonts.symbols.as_ref().unwrap_or(&fonts.text)
+        } else {
+            &fonts.text
+        };
+        font.metrics(c, size).advance_width
+    }).sum()
+}
+
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState},
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
+    output::{OutputHandler, OutputState},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
+    },
+    shell::{
+        wlr_layer::{
+            KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+            LayerSurfaceConfigure,
+        },
+        WaylandSurface,
+    },
+    shm::{slot::SlotPool, Shm, ShmHandler},
+};
+use wayland_client::{
+    globals::registry_queue_init,
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    Connection, QueueHandle,
+};
+
+// ── desktop entry + icon loading ──
+
+struct DesktopEntry {
+    name: String,
+    icon_name: String,
+    exec: String,
+}
+
+fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut name = None;
+    let mut icon = None;
+    let mut exec = None;
+    let mut in_desktop_entry = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line == "[Desktop Entry]" {
+            in_desktop_entry = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            in_desktop_entry = false;
+            continue;
+        }
+        if !in_desktop_entry { continue; }
+
+        if let Some(val) = line.strip_prefix("Name=") {
+            if name.is_none() { name = Some(val.to_string()); }
+        } else if let Some(val) = line.strip_prefix("Icon=") {
+            icon = Some(val.to_string());
+        } else if let Some(val) = line.strip_prefix("Exec=") {
+            exec = Some(val.to_string());
+        }
+    }
+
+    Some(DesktopEntry {
+        name: name?,
+        icon_name: icon.unwrap_or_default(),
+        exec: exec.unwrap_or_default(),
+    })
+}
+
+fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
+    // If it's already an absolute path
+    if icon_name.starts_with('/') {
+        let p = PathBuf::from(icon_name);
+        if p.exists() { return Some(p); }
+    }
+
+    // Search in common icon directories
+    let sizes = ["64x64", "48x48", "96x96", "128x128", "256x256", "scalable", "32x32"];
+    let categories = ["apps", "applications"];
+    let themes = ["hicolor", "Adwaita", "breeze", "Papirus"];
+    let extensions = ["png", "svg"];
+
+    for theme in themes {
+        for size in sizes {
+            for cat in categories {
+                for ext in extensions {
+                    let path = PathBuf::from(format!(
+                        "/usr/share/icons/{theme}/{size}/{cat}/{icon_name}.{ext}"
+                    ));
+                    if path.exists() { return Some(path); }
+
+                    // Also check ~/.local/share/icons
+                    if let Ok(home) = env::var("HOME") {
+                        let local_path = PathBuf::from(format!(
+                            "{home}/.local/share/icons/{theme}/{size}/{cat}/{icon_name}.{ext}"
+                        ));
+                        if local_path.exists() { return Some(local_path); }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check /usr/share/pixmaps
+    for ext in extensions {
+        let path = PathBuf::from(format!("/usr/share/pixmaps/{icon_name}.{ext}"));
+        if path.exists() { return Some(path); }
+    }
+
+    // NixOS: check /run/current-system/sw/share/icons
+    for theme in themes {
+        for size in sizes {
+            for cat in categories {
+                for ext in extensions {
+                    let path = PathBuf::from(format!(
+                        "/run/current-system/sw/share/icons/{theme}/{size}/{cat}/{icon_name}.{ext}"
+                    ));
+                    if path.exists() { return Some(path); }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+const ICON_SIZE: u32 = 48; // Unified icon size for grid and picker
+
+fn load_desktop_entries() -> Vec<(DesktopEntry, Vec<u8>, u32, u32)> {
+    let mut entries = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+
+    let app_dirs = [
+        "/usr/share/applications",
+        "/run/current-system/sw/share/applications", // NixOS
+    ];
+
+    // Also check ~/.local/share/applications
+    let home_apps = env::var("HOME")
+        .map(|h| format!("{h}/.local/share/applications"))
+        .ok();
+
+    for dir in app_dirs.iter().map(|s| s.to_string()).chain(home_apps) {
+        eprintln!("  scanning {}", dir);
+        let Ok(read_dir) = std::fs::read_dir(&dir) else { continue };
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(true, |e| e != "desktop") { continue; }
+
+            let Some(de) = parse_desktop_file(&path) else { continue };
+            if de.icon_name.is_empty() { continue; }
+            if seen_names.contains(&de.name) { continue; }
+
+            let Some(icon_path) = find_icon_file(&de.icon_name) else {
+                eprintln!("    {} - icon '{}' not found", de.name, de.icon_name);
+                continue;
+            };
+
+            let Some((pixels, w, h)) = load_icon_rgba(&icon_path, ICON_SIZE) else {
+                eprintln!("    {} - failed to load {}", de.name, icon_path.display());
+                continue;
+            };
+
+            eprintln!("    {} - scaled to {}x{}", de.name, w, h);
+            seen_names.insert(de.name.clone());
+            entries.push((de, pixels, w, h));
+        }
+    }
+
+    entries
+}
+
+fn load_icon_rgba(path: &Path, target_size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+
+    // Scale to target size if needed
+    let (w, h) = img.dimensions();
+    let img = if w != target_size || h != target_size {
+        img.resize_exact(target_size, target_size, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((rgba.into_vec(), w, h))
+}
+
+/// Launch an application from its Exec string
+fn launch_exec(exec: &str, name: &str) {
+    // Strip desktop entry field codes (%f, %F, %u, %U, %i, %c, %k, etc.)
+    let cmd: String = exec
+        .split_whitespace()
+        .filter(|s| !s.starts_with('%'))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if cmd.is_empty() {
+        eprintln!("  launch: empty command for {}", name);
+        return;
+    }
+
+    eprintln!("  launch: {} -> {}", name, cmd);
+
+    // Spawn detached process
+    match Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => eprintln!("  launch: spawned successfully"),
+        Err(e) => eprintln!("  launch: failed: {}", e),
+    }
+}
+
+/// Blit RGBA source onto ARGB8888 canvas (Wayland SHM format)
+fn blit_rgba(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_x: i32,
+    dst_y: i32,
+) {
+    for sy in 0..src_h {
+        let dy = dst_y + sy as i32;
+        if dy < 0 || dy >= canvas_h as i32 {
+            continue;
+        }
+        for sx in 0..src_w {
+            let dx = dst_x + sx as i32;
+            if dx < 0 || dx >= canvas_w as i32 {
+                continue;
+            }
+
+            let src_idx = ((sy * src_w + sx) * 4) as usize;
+            let dst_idx = ((dy as u32 * canvas_w + dx as u32) * 4) as usize;
+
+            // RGBA -> BGRA (little-endian ARGB8888)
+            let r = src[src_idx];
+            let g = src[src_idx + 1];
+            let b = src[src_idx + 2];
+            let a = src[src_idx + 3];
+
+            // Alpha blending with existing pixel
+            if a == 255 {
+                canvas[dst_idx] = b;
+                canvas[dst_idx + 1] = g;
+                canvas[dst_idx + 2] = r;
+                canvas[dst_idx + 3] = a;
+            } else if a > 0 {
+                let alpha = a as u32;
+                let inv_alpha = 255 - alpha;
+                canvas[dst_idx] = ((b as u32 * alpha + canvas[dst_idx] as u32 * inv_alpha) / 255) as u8;
+                canvas[dst_idx + 1] = ((g as u32 * alpha + canvas[dst_idx + 1] as u32 * inv_alpha) / 255) as u8;
+                canvas[dst_idx + 2] = ((r as u32 * alpha + canvas[dst_idx + 2] as u32 * inv_alpha) / 255) as u8;
+                canvas[dst_idx + 3] = 255;
+            }
+        }
+    }
+}
+
+/// Fill a rectangle with solid color (BGRA)
+fn fill_rect(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    color: [u8; 4],
+) {
+    for dy in 0..h {
+        let py = y + dy as i32;
+        if py < 0 || py >= canvas_h as i32 {
+            continue;
+        }
+        for dx in 0..w {
+            let px = x + dx as i32;
+            if px < 0 || px >= canvas_w as i32 {
+                continue;
+            }
+            let idx = ((py as u32 * canvas_w + px as u32) * 4) as usize;
+            canvas[idx..idx + 4].copy_from_slice(&color);
+        }
+    }
+}
+
+fn main() {
+    // ── env probe ──
+    eprintln!("=== wlgrid layer-shell probe ===");
+    for k in [
+        "XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+    ] {
+        eprintln!("  {k} = {}", env::var(k).unwrap_or("<unset>".into()));
+    }
+    for lib in ["libwayland-client.so.0", "libwayland-egl.so.1", "libxkbcommon.so.0"] {
+        let ok = unsafe { libloading::Library::new(lib).is_ok() };
+        eprintln!("  {lib:36} {}", if ok { "OK" } else { "MISSING" });
+    }
+
+    // ── connect to wayland ──
+    let conn = Connection::connect_to_env().unwrap();
+    let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
+    let qh = event_queue.handle();
+    eprintln!("  wayland connection OK");
+
+    let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
+    let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell missing");
+    let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
+    eprintln!("  compositor + layer_shell + shm bound");
+
+    // Load config
+    let config = load_config();
+
+    // Grid configuration
+    let grid_w: usize = 6;
+    let grid_h: usize = 4;
+    let tile_size: u32 = 64;
+    let tile_gap: u32 = 8;
+    let num_tiles = grid_w * grid_h;
+
+    // Load bottom bar items from config
+    let dock: Vec<DockEntry> = config.bottom_bar
+        .as_ref()
+        .map(|bb| parse_bottom_bar_options(&bb.options))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| {
+            eprintln!("  bar item: {} -> {}", item.name, item.exec);
+            DockEntry {
+                name: item.name,
+                exec: item.exec,
+            }
+        })
+        .collect();
+    eprintln!("  loaded {} bottom bar items", dock.len());
+
+    // Calculate surface size (grid + dock bar if dock has items)
+    let surface_w = 16 + grid_w as u32 * tile_size + (grid_w - 1) as u32 * tile_gap;
+    let grid_height = 16 + grid_h as u32 * tile_size + (grid_h - 1) as u32 * tile_gap;
+    let surface_h = if dock.is_empty() {
+        grid_height
+    } else {
+        grid_height + DOCK_HEIGHT
+    };
+
+    // ── create layer surface ──
+    let surface = compositor.create_surface(&qh);
+    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("wlgrid"), None);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    layer.set_size(surface_w, surface_h);
+    layer.commit();
+    eprintln!("  layer surface {}x{}, waiting for configure...", surface_w, surface_h);
+
+    let pool = SlotPool::new((surface_w * surface_h * 4) as usize, &shm).expect("pool alloc failed");
+
+    // Try to load from cache first (fast path)
+    let (icons, fonts) = if let Some(cache) = load_cache() {
+        // Load icons from cache
+        let icons: Vec<Icon> = cache.icons.into_iter().map(|ci| Icon {
+            name: ci.name,
+            exec: ci.exec,
+            pixels: ci.pixels,
+            width: ci.width,
+            height: ci.height,
+        }).collect();
+
+        // Load fonts from cached paths
+        let fonts = cache.text_font_path.as_ref().and_then(|text_path| {
+            load_fonts_from_paths(text_path, cache.symbols_font_path.as_deref())
+        });
+
+        eprintln!("  cache: loaded {} icons", icons.len());
+        (icons, fonts)
+    } else {
+        // Cache miss - do full load (slow path)
+        eprintln!("  cache: miss, doing full load");
+
+        // Load desktop entries
+        let desktop_entries = load_desktop_entries();
+        let icons: Vec<Icon> = desktop_entries
+            .into_iter()
+            .map(|(de, pixels, w, h)| Icon {
+                name: de.name,
+                exec: de.exec,
+                pixels,
+                width: w,
+                height: h,
+            })
+            .collect();
+        eprintln!("  loaded {} desktop entries", icons.len());
+
+        // Load fonts with search
+        let fonts_with_paths = load_fonts_with_search();
+        let fonts = fonts_with_paths.as_ref().map(|fp| Fonts {
+            text: fp.fonts.text.clone(),
+            symbols: fp.fonts.symbols.clone(),
+        });
+
+        // Save cache for next time
+        if let Some(ref fp) = fonts_with_paths {
+            save_cache(&icons, Some(&fp.text_path), fp.symbols_path.as_deref());
+        } else {
+            save_cache(&icons, None, None);
+        }
+
+        (icons, fonts)
+    };
+
+    if fonts.is_some() {
+        eprintln!("  fonts loaded successfully");
+    }
+
+    // Load saved state and restore tiles
+    let saved_state = load_state();
+    let tiles: Vec<Option<usize>> = (0..num_tiles)
+        .map(|i| {
+            saved_state.tiles.get(i).and_then(|opt_name| {
+                opt_name.as_ref().and_then(|name| {
+                    icons.iter().position(|icon| &icon.name == name)
+                })
+            })
+        })
+        .collect();
+    let restored_count = tiles.iter().filter(|t| t.is_some()).count();
+    eprintln!("  restored {} tiles from saved state", restored_count);
+
+    let mut app = App {
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state: OutputState::new(&globals, &qh),
+        shm,
+        exit: false,
+        first_configure: true,
+        pool,
+        width: surface_w,
+        height: surface_h,
+        layer,
+        keyboard: None,
+        pointer: None,
+        grid_w,
+        grid_h,
+        tile_size,
+        tile_gap,
+        tiles,
+        icons,
+        pointer_pos: (0.0, 0.0),
+        hovered_tile: None,
+        press_start: None,
+        drag_from: None,
+        drag_threshold: 5.0,
+        dirty: true,
+        frame_pending: false,
+        picker_target: None,
+        picker_scroll: 0,
+        picker_hovered: None,
+        dock,
+        hovered_dock: None,
+        fonts,
+    };
+
+    loop {
+        event_queue.blocking_dispatch(&mut app).unwrap();
+        if app.exit { break; }
+    }
+
+    // Save state before exiting
+    save_state(&app.tiles, &app.icons);
+    eprintln!("  exiting");
+}
+
+struct Icon {
+    name: String,
+    exec: String,
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+struct DockEntry {
+    name: String,
+    exec: String,
+}
+
+const DOCK_HEIGHT: u32 = 64;
+
+struct App {
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
+    shm: Shm,
+    exit: bool,
+    first_configure: bool,
+    pool: SlotPool,
+    width: u32,
+    height: u32,
+    layer: LayerSurface,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    // Grid config
+    grid_w: usize,
+    grid_h: usize,
+    tile_size: u32,
+    tile_gap: u32,
+    // Grid state: which tiles have icons (index into icons vec)
+    tiles: Vec<Option<usize>>,
+    icons: Vec<Icon>,
+    // Pointer state (Phase 3 & 4)
+    pointer_pos: (f64, f64),
+    hovered_tile: Option<usize>,
+    press_start: Option<(f64, f64, usize)>, // (x, y, tile_index) when pressed
+    drag_from: Option<usize>,
+    drag_threshold: f64,
+    // Rendering state
+    dirty: bool,
+    frame_pending: bool,
+    // Picker state
+    picker_target: Option<usize>,    // which tile we're picking for (None = closed)
+    picker_scroll: usize,            // scroll offset in picker list
+    picker_hovered: Option<usize>,   // which picker item is hovered (icon index)
+    // Dock state
+    dock: Vec<DockEntry>,
+    hovered_dock: Option<usize>,
+    // Fonts for text rendering (text + symbols)
+    fonts: Option<Fonts>,
+}
+
+impl App {
+    fn required_size(&self) -> (u32, u32) {
+        let w = 16 + self.grid_w as u32 * self.tile_size + self.grid_w.saturating_sub(1) as u32 * self.tile_gap;
+        let h = 16 + self.grid_h as u32 * self.tile_size + self.grid_h.saturating_sub(1) as u32 * self.tile_gap;
+        (w, h)
+    }
+
+    fn tile_rect(&self, index: usize) -> (i32, i32, u32, u32) {
+        let col = index % self.grid_w;
+        let row = index / self.grid_w;
+        let x = 8 + (col as u32 * (self.tile_size + self.tile_gap)) as i32;
+        let y = 8 + (row as u32 * (self.tile_size + self.tile_gap)) as i32;
+        (x, y, self.tile_size, self.tile_size)
+    }
+
+    fn tile_at(&self, x: f64, y: f64) -> Option<usize> {
+        for i in 0..(self.grid_w * self.grid_h) {
+            let (tx, ty, tw, th) = self.tile_rect(i);
+            if x >= tx as f64 && x < (tx + tw as i32) as f64 &&
+               y >= ty as f64 && y < (ty + th as i32) as f64 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn dock_bar_y(&self) -> i32 {
+        // Dock starts after the grid
+        let grid_h = 16 + self.grid_h as u32 * self.tile_size + self.grid_h.saturating_sub(1) as u32 * self.tile_gap;
+        grid_h as i32
+    }
+
+    fn dock_item_at(&self, x: f64, y: f64) -> Option<usize> {
+        if self.dock.is_empty() {
+            return None;
+        }
+        let dock_y = self.dock_bar_y();
+        if y < dock_y as f64 || y >= (dock_y as f64 + DOCK_HEIGHT as f64) {
+            return None;
+        }
+        // Use the same spacing-based hit test as the rendering
+        let item_spacing = self.width / self.dock.len() as u32;
+        for i in 0..self.dock.len() {
+            let start_x = i as u32 * item_spacing;
+            let end_x = start_x + item_spacing;
+            if x >= start_x as f64 && x < end_x as f64 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn request_frame(&mut self, qh: &QueueHandle<Self>) {
+        if !self.frame_pending {
+            self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
+            self.layer.commit();
+            self.frame_pending = true;
+            eprintln!("  request_frame: scheduled");
+        }
+    }
+
+    // Picker constants
+    const PICKER_ITEM_SIZE: u32 = 48;
+    const PICKER_ITEM_GAP: u32 = 4;
+    const PICKER_COLS: usize = 4;
+    const PICKER_VISIBLE_ROWS: usize = 3;
+
+    fn picker_rect(&self) -> (i32, i32, u32, u32) {
+        // Center the picker in the surface
+        let cols = Self::PICKER_COLS as u32;
+        let rows = Self::PICKER_VISIBLE_ROWS as u32;
+        let pw = 16 + cols * Self::PICKER_ITEM_SIZE + (cols - 1) * Self::PICKER_ITEM_GAP;
+        let ph = 16 + rows * Self::PICKER_ITEM_SIZE + (rows - 1) * Self::PICKER_ITEM_GAP;
+        let px = (self.width as i32 - pw as i32) / 2;
+        let py = (self.height as i32 - ph as i32) / 2;
+        (px, py, pw, ph)
+    }
+
+    fn picker_item_rect(&self, index: usize) -> (i32, i32, u32, u32) {
+        let (px, py, _, _) = self.picker_rect();
+        let col = index % Self::PICKER_COLS;
+        let row = index / Self::PICKER_COLS;
+        let x = px + 8 + (col as u32 * (Self::PICKER_ITEM_SIZE + Self::PICKER_ITEM_GAP)) as i32;
+        let y = py + 8 + (row as u32 * (Self::PICKER_ITEM_SIZE + Self::PICKER_ITEM_GAP)) as i32;
+        (x, y, Self::PICKER_ITEM_SIZE, Self::PICKER_ITEM_SIZE)
+    }
+
+    fn picker_item_at(&self, x: f64, y: f64) -> Option<usize> {
+        let (px, py, pw, ph) = self.picker_rect();
+        // Check if inside picker bounds
+        if x < px as f64 || x >= (px + pw as i32) as f64 ||
+           y < py as f64 || y >= (py + ph as i32) as f64 {
+            return None;
+        }
+        // Check each visible item
+        let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
+        for i in 0..visible_count {
+            let icon_idx = self.picker_scroll + i;
+            if icon_idx >= self.icons.len() { break; }
+            let (ix, iy, iw, ih) = self.picker_item_rect(i);
+            if x >= ix as f64 && x < (ix + iw as i32) as f64 &&
+               y >= iy as f64 && y < (iy + ih as i32) as f64 {
+                return Some(icon_idx);
+            }
+        }
+        None
+    }
+
+    fn draw(&mut self, qh: &QueueHandle<Self>) {
+        self.dirty = false;
+        let t0 = Instant::now();
+
+        let (w, h) = (self.width, self.height);
+        let num_tiles = self.grid_w * self.grid_h;
+        let tile_size = self.tile_size;
+        let hovered = self.hovered_tile;
+        let drag_from = self.drag_from;
+        let pointer_pos = self.pointer_pos;
+
+        // Build draw list: (tile_index, tile_x, tile_y, Option<icon_index>)
+        // NO CLONING - just indices
+        let draw_list: Vec<_> = (0..num_tiles)
+            .map(|i| {
+                let (tx, ty, _, _) = self.tile_rect(i);
+                let icon_idx = self.tiles.get(i).and_then(|slot| *slot);
+                (i, tx, ty, icon_idx)
+            })
+            .collect();
+
+        // Get dragged icon index
+        let dragged_icon_idx = drag_from.and_then(|from| {
+            self.tiles.get(from).and_then(|slot| *slot)
+        });
+
+        // Pre-compute drop target rect
+        let drop_target_rect = drag_from.and_then(|from| {
+            hovered.filter(|&to| from != to).map(|to| self.tile_rect(to))
+        });
+
+        // Pre-compute picker data
+        let picker_data = if self.picker_target.is_some() {
+            let rect = self.picker_rect();
+            let picker_hovered = self.picker_hovered;
+            let picker_scroll = self.picker_scroll;
+            let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
+            let items: Vec<_> = (0..visible_count)
+                .filter_map(|i| {
+                    let icon_idx = picker_scroll + i;
+                    if icon_idx >= self.icons.len() { return None; }
+                    Some((icon_idx, self.picker_item_rect(i)))
+                })
+                .collect();
+            Some((rect, picker_hovered, items))
+        } else {
+            None
+        };
+
+        // Pre-compute dock data
+        let hovered_dock = self.hovered_dock;
+        let dock_y = if self.dock.is_empty() { 0 } else { self.dock_bar_y() };
+
+        let t1 = Instant::now();
+        eprintln!("  draw: precompute {:.2}ms", (t1 - t0).as_secs_f64() * 1000.0);
+
+        let stride = w as i32 * 4;
+        let (buffer, canvas) = self.pool
+            .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+            .expect("create buffer");
+
+        let t2 = Instant::now();
+        eprintln!("  draw: create_buffer {:.2}ms", (t2 - t1).as_secs_f64() * 1000.0);
+
+        // Clear to dark background (BGRA)
+        canvas.chunks_exact_mut(4).for_each(|chunk| {
+            chunk.copy_from_slice(&[0x12, 0x12, 0x12, 0xFF]);
+        });
+
+        let t3 = Instant::now();
+        eprintln!("  draw: clear {:.2}ms", (t3 - t2).as_secs_f64() * 1000.0);
+
+        // Draw grid of tiles
+        for (i, tx, ty, icon_idx) in &draw_list {
+            // Tile background - lighter when hovered
+            let bg_color = if hovered == Some(*i) {
+                [0x46, 0x46, 0x46, 0xFF]
+            } else {
+                [0x2D, 0x2D, 0x2D, 0xFF]
+            };
+            fill_rect(canvas, w, h, *tx, *ty, tile_size, tile_size, bg_color);
+
+            // Draw icon if present (skip if being dragged)
+            if let Some(idx) = icon_idx {
+                if drag_from != Some(*i) {
+                    if let Some(icon) = self.icons.get(*idx) {
+                        let ix = tx + (tile_size as i32 - icon.width as i32) / 2;
+                        let iy = ty + (tile_size as i32 - icon.height as i32) / 2;
+                        blit_rgba(canvas, w, h, &icon.pixels, icon.width, icon.height, ix, iy);
+                    }
+                }
+            }
+        }
+
+        let t4 = Instant::now();
+        eprintln!("  draw: tiles {:.2}ms", (t4 - t3).as_secs_f64() * 1000.0);
+
+        // Draw dock bar
+        if !self.dock.is_empty() {
+            // Dock background - slightly lighter
+            fill_rect(canvas, w, h, 0, dock_y, w, DOCK_HEIGHT, [0x1A, 0x1A, 0x1A, 0xFF]);
+
+            // Draw dock items evenly spaced - no boxes, just text
+            let font_size = 16.0f32;
+            let item_count = self.dock.len() as u32;
+            let item_spacing = w / item_count;
+
+            for (i, entry) in self.dock.iter().enumerate() {
+                let center_x = (i as u32 * item_spacing + item_spacing / 2) as i32;
+
+                // Text color: brighter when hovered
+                let text_color = if hovered_dock == Some(i) {
+                    [0xFF, 0xFF, 0xFF, 0xFF] // bright white
+                } else {
+                    [0xCC, 0xCC, 0xCC, 0xFF] // slightly dimmer
+                };
+
+                if let Some(ref fonts) = self.fonts {
+                    let tw = text_width(fonts, &entry.name, font_size) as i32;
+                    let text_x = center_x - tw / 2;
+                    let text_y = dock_y + (DOCK_HEIGHT as i32 / 2) + (font_size as i32 / 3);
+                    render_text(canvas, w, h, fonts, &entry.name, text_x, text_y, font_size, text_color);
+                }
+            }
+        }
+
+        // Draw drop target highlight during drag
+        if drag_from.is_some() {
+            if let Some((tx, ty, tw, th)) = drop_target_rect {
+                draw_rect_outline(canvas, w, h, tx, ty, tw, th, [0x00, 0xFF, 0x00, 0xFF], 2);
+            }
+
+            // Draw dragged icon following cursor
+            if let Some(idx) = dragged_icon_idx {
+                if let Some(icon) = self.icons.get(idx) {
+                    let x = pointer_pos.0 as i32 - icon.width as i32 / 2;
+                    let y = pointer_pos.1 as i32 - icon.height as i32 / 2;
+                    blit_rgba(canvas, w, h, &icon.pixels, icon.width, icon.height, x, y);
+                }
+            }
+        }
+
+        let t5 = Instant::now();
+        eprintln!("  draw: drag overlay {:.2}ms", (t5 - t4).as_secs_f64() * 1000.0);
+
+        // Draw picker if open
+        if let Some(((px, py, pw, ph), picker_hovered, items)) = picker_data {
+            // Dim background
+            for y_pos in 0..h {
+                for x_pos in 0..w {
+                    let idx = ((y_pos * w + x_pos) * 4) as usize;
+                    canvas[idx] = canvas[idx] / 2;
+                    canvas[idx + 1] = canvas[idx + 1] / 2;
+                    canvas[idx + 2] = canvas[idx + 2] / 2;
+                }
+            }
+
+            // Picker background
+            fill_rect(canvas, w, h, px, py, pw, ph, [0x1A, 0x1A, 0x1A, 0xFF]);
+            draw_rect_outline(canvas, w, h, px, py, pw, ph, [0x55, 0x55, 0x55, 0xFF], 2);
+
+            // Draw picker items
+            for (icon_idx, (ix, iy, iw, ih)) in items {
+                // Item background (highlight if hovered)
+                let bg = if picker_hovered == Some(icon_idx) {
+                    [0x46, 0x46, 0x46, 0xFF]
+                } else {
+                    [0x2D, 0x2D, 0x2D, 0xFF]
+                };
+                fill_rect(canvas, w, h, ix, iy, iw, ih, bg);
+
+                // Draw icon
+                if let Some(icon) = self.icons.get(icon_idx) {
+                    let ox = ix + (iw as i32 - icon.width as i32) / 2;
+                    let oy = iy + (ih as i32 - icon.height as i32) / 2;
+                    blit_rgba(canvas, w, h, &icon.pixels, icon.width, icon.height, ox, oy);
+                }
+            }
+        }
+
+        let t6 = Instant::now();
+        eprintln!("  draw: picker {:.2}ms", (t6 - t5).as_secs_f64() * 1000.0);
+
+        self.layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
+        self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
+        buffer.attach_to(self.layer.wl_surface()).expect("buffer attach");
+        self.layer.commit();
+        self.frame_pending = true;
+
+        let t7 = Instant::now();
+        eprintln!("  draw: commit {:.2}ms, TOTAL {:.2}ms", (t7 - t6).as_secs_f64() * 1000.0, (t7 - t0).as_secs_f64() * 1000.0);
+    }
+}
+
+/// Draw rectangle outline
+fn draw_rect_outline(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    color: [u8; 4],
+    thickness: u32,
+) {
+    // Top edge
+    fill_rect(canvas, canvas_w, canvas_h, x, y, w, thickness, color);
+    // Bottom edge
+    fill_rect(canvas, canvas_w, canvas_h, x, y + h as i32 - thickness as i32, w, thickness, color);
+    // Left edge
+    fill_rect(canvas, canvas_w, canvas_h, x, y, thickness, h, color);
+    // Right edge
+    fill_rect(canvas, canvas_w, canvas_h, x + w as i32 - thickness as i32, y, thickness, h, color);
+}
+
+// ── handler impls (mostly stubs) ──
+
+impl CompositorHandler for App {
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
+    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+        self.frame_pending = false;
+        if self.dirty {
+            self.draw(qh);
+        }
+    }
+    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+}
+
+impl OutputHandler for App {
+    fn output_state(&mut self) -> &mut OutputState { &mut self.output_state }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+}
+
+impl LayerShellHandler for App {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) { self.exit = true; }
+    fn configure(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
+        let old_w = self.width;
+        let old_h = self.height;
+        if cfg.new_size.0 != 0 { self.width = cfg.new_size.0; }
+        if cfg.new_size.1 != 0 { self.height = cfg.new_size.1; }
+
+        // Resize pool if surface got larger
+        if self.width != old_w || self.height != old_h {
+            let new_size = (self.width * self.height * 4) as usize;
+            if self.pool.len() < new_size {
+                eprintln!("  resizing pool: {} -> {}", self.pool.len(), new_size);
+                self.pool.resize(new_size).expect("pool resize");
+            }
+        }
+
+        if self.first_configure {
+            self.first_configure = false;
+            eprintln!("  configured {}x{}, drawing first frame", self.width, self.height);
+            self.draw(qh);
+        }
+    }
+}
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState { &mut self.seat_state }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Keyboard && self.keyboard.is_none() {
+            self.keyboard = Some(self.seat_state.get_keyboard(qh, &seat, None).expect("keyboard"));
+        }
+        if cap == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = Some(self.seat_state.get_pointer(qh, &seat).expect("pointer"));
+        }
+    }
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Keyboard { self.keyboard.take().map(|k| k.release()); }
+        if cap == Capability::Pointer { self.pointer.take().map(|p| p.release()); }
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl KeyboardHandler for App {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
+    fn press_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+        eprintln!("  key: {:?}", event.keysym);
+        if event.keysym == Keysym::Escape {
+            if self.picker_target.is_some() {
+                // Close picker
+                eprintln!("  picker: closed (escape)");
+                self.picker_target = None;
+                self.picker_hovered = None;
+                self.dirty = true;
+                self.request_frame(qh);
+            } else {
+                // Exit app
+                self.exit = true;
+            }
+        }
+    }
+    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
+    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: Modifiers, _: u32) {}
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        let t0 = Instant::now();
+        let mut needs_redraw = false;
+        let event_count = events.len();
+
+        for ev in events {
+            if &ev.surface != self.layer.wl_surface() { continue; }
+
+            // If picker is open, handle picker interactions
+            if self.picker_target.is_some() {
+                match ev.kind {
+                    PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                        self.pointer_pos = ev.position;
+                        let new_hovered = self.picker_item_at(ev.position.0, ev.position.1);
+                        if new_hovered != self.picker_hovered {
+                            self.picker_hovered = new_hovered;
+                            needs_redraw = true;
+                        }
+                    }
+                    PointerEventKind::Press { button, .. } if button == 0x110 => {
+                        // Left click in picker
+                        if let Some(icon_idx) = self.picker_item_at(ev.position.0, ev.position.1) {
+                            // Select this icon for the target tile
+                            if let Some(target) = self.picker_target {
+                                self.tiles[target] = Some(icon_idx);
+                                eprintln!("  picker: assigned icon {} to tile {}", icon_idx, target);
+                            }
+                            self.picker_target = None;
+                            self.picker_hovered = None;
+                            needs_redraw = true;
+                        } else {
+                            // Clicked outside picker - close it
+                            eprintln!("  picker: closed (clicked outside)");
+                            self.picker_target = None;
+                            self.picker_hovered = None;
+                            needs_redraw = true;
+                        }
+                    }
+                    PointerEventKind::Axis { vertical, .. } => {
+                        // Scroll in picker (use absolute value, positive = down)
+                        let scroll_dir = if vertical.absolute > 0.0 { 1 } else if vertical.absolute < 0.0 { -1 } else { 0 };
+                        if scroll_dir != 0 {
+                            let max_scroll = self.icons.len().saturating_sub(Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS);
+                            if scroll_dir > 0 {
+                                // Scroll down
+                                self.picker_scroll = (self.picker_scroll + Self::PICKER_COLS).min(max_scroll);
+                            } else {
+                                // Scroll up
+                                self.picker_scroll = self.picker_scroll.saturating_sub(Self::PICKER_COLS);
+                            }
+                            eprintln!("  picker: scroll to {}/{}", self.picker_scroll, self.icons.len());
+                            needs_redraw = true;
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Normal grid interactions (picker closed)
+            match ev.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.pointer_pos = ev.position;
+                    let new_hovered = self.tile_at(ev.position.0, ev.position.1);
+                    let new_dock_hovered = self.dock_item_at(ev.position.0, ev.position.1);
+
+                    // Check if we should start dragging
+                    if let Some((px, py, tile)) = self.press_start {
+                        let dx = ev.position.0 - px;
+                        let dy = ev.position.1 - py;
+                        let dist = (dx * dx + dy * dy).sqrt();
+
+                        if dist > self.drag_threshold && self.drag_from.is_none() {
+                            self.drag_from = Some(tile);
+                            self.press_start = None;
+                            eprintln!("  drag start from tile {}", tile);
+                            needs_redraw = true;
+                        }
+                    }
+
+                    // Update grid hover state
+                    if new_hovered != self.hovered_tile {
+                        self.hovered_tile = new_hovered;
+                        needs_redraw = true;
+                    }
+
+                    // Update dock hover state
+                    if new_dock_hovered != self.hovered_dock {
+                        self.hovered_dock = new_dock_hovered;
+                        needs_redraw = true;
+                    }
+
+                    // Redraw during drag to update icon position
+                    if self.drag_from.is_some() {
+                        needs_redraw = true;
+                    }
+                }
+                PointerEventKind::Leave { .. } => {
+                    self.hovered_tile = None;
+                    self.hovered_dock = None;
+                    needs_redraw = true;
+                }
+                PointerEventKind::Press { button, .. } => {
+                    if button == 0x110 { // BTN_LEFT
+                        if let Some(tile) = self.tile_at(ev.position.0, ev.position.1) {
+                            self.press_start = Some((ev.position.0, ev.position.1, tile));
+                        } else if let Some(dock_idx) = self.dock_item_at(ev.position.0, ev.position.1) {
+                            // Click on dock item - launch immediately
+                            if let Some(entry) = self.dock.get(dock_idx) {
+                                launch_exec(&entry.exec, &entry.name);
+                                self.exit = true;
+                            }
+                        }
+                    }
+                }
+                PointerEventKind::Release { button, .. } => {
+                    if button == 0x110 { // BTN_LEFT
+                        if let Some(from) = self.drag_from.take() {
+                            // Was dragging - do the swap
+                            if let Some(to) = self.tile_at(ev.position.0, ev.position.1) {
+                                if from != to {
+                                    self.tiles.swap(from, to);
+                                    eprintln!("  swapped tile {} <-> {}", from, to);
+                                }
+                            }
+                            needs_redraw = true;
+                        } else if let Some((_, _, tile)) = self.press_start.take() {
+                            // Was a click (no drag happened)
+                            if self.tiles[tile].is_none() {
+                                // Empty tile - open picker
+                                eprintln!("  picker: opening for tile {}", tile);
+                                self.picker_target = Some(tile);
+                                self.picker_scroll = 0;
+                                self.picker_hovered = None;
+                                needs_redraw = true;
+                            } else if let Some(icon_idx) = self.tiles[tile] {
+                                // Filled tile - launch the app
+                                if let Some(icon) = self.icons.get(icon_idx) {
+                                    launch_exec(&icon.exec, &icon.name);
+                                    // Exit after launching
+                                    self.exit = true;
+                                }
+                            }
+                        }
+                    } else if button == 0x111 { // BTN_RIGHT
+                        if let Some(tile) = self.tile_at(ev.position.0, ev.position.1) {
+                            self.tiles[tile] = None;
+                            eprintln!("  removed tile {}", tile);
+                            needs_redraw = true;
+                        }
+                    }
+                    self.press_start = None;
+                }
+                _ => {}
+            }
+        }
+
+        let t1 = Instant::now();
+        if needs_redraw {
+            eprintln!("pointer_frame: {} events, process {:.2}ms, marking dirty", event_count, (t1 - t0).as_secs_f64() * 1000.0);
+            self.dirty = true;
+            self.request_frame(qh);
+        }
+    }
+}
+
+impl ShmHandler for App {
+    fn shm_state(&mut self) -> &mut Shm { &mut self.shm }
+}
+
+delegate_compositor!(App);
+delegate_output!(App);
+delegate_shm!(App);
+delegate_seat!(App);
+delegate_keyboard!(App);
+delegate_pointer!(App);
+delegate_layer!(App);
+delegate_registry!(App);
+
+impl ProvidesRegistryState for App {
+    fn registry(&mut self) -> &mut RegistryState { &mut self.registry_state }
+    registry_handlers![OutputState, SeatState];
+}

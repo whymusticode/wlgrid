@@ -676,7 +676,7 @@ fn load_icon_rgba(path: &Path, target_size: u32) -> Option<(Vec<u8>, u32, u32)> 
 }
 
 fn load_svg_rgba(data: &[u8], target_size: u32) -> Option<(Vec<u8>, u32, u32)> {
-    use resvg::usvg::{self, Options, Tree};
+    use resvg::usvg::{Options, Tree};
     use resvg::tiny_skia::{self, Pixmap};
 
     let tree = Tree::from_data(data, &Options::default()).ok()?;
@@ -700,28 +700,49 @@ fn load_svg_rgba(data: &[u8], target_size: u32) -> Option<(Vec<u8>, u32, u32)> {
     Some((pixmap.take(), target_size, target_size))
 }
 
-/// Launch an application from its Exec string
+/// Wake up the cursor by jiggling it (for compositors that hide cursor on inactivity)
+fn wake_cursor() {
+    // Jiggle pattern: +1, -2, +1 (nets to 0)
+    let jiggle = |dx: i32| {
+        Command::new("ydotool")
+            .args(["mousemove", "-x", &dx.to_string(), "-y", "0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut c| c.wait())
+    };
+
+    if jiggle(1).is_ok() {
+        let _ = jiggle(-2);
+        let _ = jiggle(1);
+        eprintln!("  cursor: woke via ydotool");
+    }
+}
+
+/// Launch an application from its Exec string (without shell - secure)
 fn launch_exec(exec: &str, name: &str) {
     eprintln!("  launch: raw exec = '{}'", exec);
 
+    // Parse exec string: first token is the program, rest are arguments
     // Strip desktop entry field codes (%f, %F, %u, %U, %i, %c, %k, etc.)
-    let cmd: String = exec
+    let parts: Vec<&str> = exec
         .split_whitespace()
         .filter(|s| !s.starts_with('%'))
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect();
 
-    if cmd.is_empty() {
+    if parts.is_empty() {
         eprintln!("  launch: empty command for {}", name);
         return;
     }
 
-    eprintln!("  launch: {} -> '{}'", name, cmd);
+    let program = parts[0];
+    let args = &parts[1..];
 
-    // Spawn detached process
-    match Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
+    eprintln!("  launch: {} -> '{}' {:?}", name, program, args);
+
+    // Spawn detached process directly (no shell)
+    match Command::new(program)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -836,9 +857,9 @@ fn main() {
     // Load config
     let config = load_config();
 
-    // Grid configuration
-    let grid_w: usize = 6;
-    let grid_h: usize = 4;
+    // Grid configuration from config
+    let grid_w: usize = config.width.unwrap_or(6);
+    let grid_h: usize = config.height.unwrap_or(4);
     let tile_size: u32 = 64;
     let tile_gap: u32 = 8;
     let num_tiles = grid_w * grid_h;
@@ -884,6 +905,9 @@ fn main() {
     eprintln!("  layer surface {}x{}, waiting for configure...", surface_w, surface_h);
 
     let pool = SlotPool::new((surface_w * surface_h * 4) as usize, &shm).expect("pool alloc failed");
+
+    // Wake up the cursor (in case it's hidden from inactivity)
+    wake_cursor();
 
     // Try to load from cache first (fast path)
     let (icons, fonts) = if let Some(cache) = load_cache() {
@@ -990,6 +1014,7 @@ fn main() {
         dock_font_size,
         fonts,
         opacity,
+        search_query: String::new(),
     };
 
     loop {
@@ -1059,6 +1084,8 @@ struct App {
     fonts: Option<Fonts>,
     // Appearance
     opacity: f32,
+    // Search state
+    search_query: String,
 }
 
 impl App {
@@ -1169,6 +1196,21 @@ impl App {
         None
     }
 
+    fn find_best_match(&self) -> Option<&Icon> {
+        if self.search_query.is_empty() {
+            return None;
+        }
+        let query = self.search_query.to_lowercase();
+
+        // First try exact prefix match
+        if let Some(icon) = self.icons.iter().find(|i| i.name.to_lowercase().starts_with(&query)) {
+            return Some(icon);
+        }
+
+        // Then try contains match
+        self.icons.iter().find(|i| i.name.to_lowercase().contains(&query))
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>) {
         self.dirty = false;
         let t0 = Instant::now();
@@ -1221,6 +1263,19 @@ impl App {
         // Pre-compute dock data
         let hovered_dock = self.hovered_dock;
         let dock_y = if self.dock.is_empty() { 0 } else { self.dock_bar_y() };
+
+        // Pre-compute search box data
+        let search_data: Option<(String, bool)> = if !self.search_query.is_empty() {
+            let best_match = self.find_best_match();
+            let display_text = if let Some(icon) = best_match {
+                format!("{} → {}", self.search_query, icon.name)
+            } else {
+                format!("{} (no match)", self.search_query)
+            };
+            Some((display_text, best_match.is_some()))
+        } else {
+            None
+        };
 
         let t1 = Instant::now();
         eprintln!("  draw: precompute {:.2}ms", (t1 - t0).as_secs_f64() * 1000.0);
@@ -1353,6 +1408,33 @@ impl App {
         let t6 = Instant::now();
         eprintln!("  draw: picker {:.2}ms", (t6 - t5).as_secs_f64() * 1000.0);
 
+        // Draw search box if query is not empty
+        if let Some((display_text, has_match)) = search_data {
+            if let Some(ref fonts) = self.fonts {
+                // Draw search box at the top center
+                let font_size = 24.0;
+                let tw = text_width(fonts, &display_text, font_size) as u32;
+                let box_w = tw + 32;
+                let box_h = 40;
+                let box_x = (w as i32 - box_w as i32) / 2;
+                let box_y = 8;
+
+                // Background
+                fill_rect(canvas, w, h, box_x, box_y, box_w, box_h, [0x00, 0x00, 0x00, 0xDD]);
+                draw_rect_outline(canvas, w, h, box_x, box_y, box_w, box_h, [0x88, 0x88, 0xFF, 0xFF], 2);
+
+                // Text
+                let text_x = box_x + 16;
+                let text_y = box_y + 28;
+                let text_color = if has_match {
+                    [0xFF, 0xFF, 0xFF, 0xFF]
+                } else {
+                    [0xFF, 0x88, 0x88, 0xFF]
+                };
+                render_text(canvas, w, h, fonts, &display_text, text_x, text_y, font_size, text_color);
+            }
+        }
+
         self.layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
         self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
         buffer.attach_to(self.layer.wl_surface()).expect("buffer attach");
@@ -1456,8 +1538,14 @@ impl KeyboardHandler for App {
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
     fn press_key(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
         eprintln!("  key: {:?}", event.keysym);
+
         if event.keysym == Keysym::Escape {
-            if self.picker_target.is_some() {
+            if !self.search_query.is_empty() {
+                // Clear search first
+                self.search_query.clear();
+                self.dirty = true;
+                self.request_frame(qh);
+            } else if self.picker_target.is_some() {
                 // Close picker
                 eprintln!("  picker: closed (escape)");
                 self.picker_target = None;
@@ -1467,6 +1555,29 @@ impl KeyboardHandler for App {
             } else {
                 // Exit app
                 self.exit = true;
+            }
+        } else if event.keysym == Keysym::BackSpace {
+            if !self.search_query.is_empty() {
+                self.search_query.pop();
+                eprintln!("  search: '{}'", self.search_query);
+                self.dirty = true;
+                self.request_frame(qh);
+            }
+        } else if event.keysym == Keysym::Return {
+            // Launch best match
+            if !self.search_query.is_empty() {
+                if let Some(icon) = self.find_best_match() {
+                    launch_exec(&icon.exec, &icon.name);
+                    self.exit = true;
+                }
+            }
+        } else if let Some(c) = event.utf8.as_ref().and_then(|s| s.chars().next()) {
+            // Printable character - add to search
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                self.search_query.push(c);
+                eprintln!("  search: '{}'", self.search_query);
+                self.dirty = true;
+                self.request_frame(qh);
             }
         }
     }

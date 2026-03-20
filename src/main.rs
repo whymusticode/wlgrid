@@ -1039,7 +1039,7 @@ fn main() {
         tiles,
         icons,
         pointer_pos: (0.0, 0.0),
-        hovered_tile: None,
+        hovered_tile: Some(0),  // start with first tile focused
         press_start: None,
         drag_from: None,
         drag_threshold: 5.0,
@@ -1114,7 +1114,7 @@ struct App {
     icons: Vec<Icon>,
     // Pointer state (Phase 3 & 4)
     pointer_pos: (f64, f64),
-    hovered_tile: Option<usize>,
+    hovered_tile: Option<usize>,  // shared by mouse and keyboard
     press_start: Option<(f64, f64, usize)>, // (x, y, tile_index) when pressed
     drag_from: Option<usize>,
     drag_threshold: f64,
@@ -1676,9 +1676,27 @@ impl App {
         if let Some((display_text, has_match, show_engines)) = search_data {
             if let Some(ref fonts) = self.fonts {
                 let font_size = 24.0;
+                let btn_font_size = 14.0;
+                let btn_gap = 8i32;
                 let tw = text_width(fonts, &display_text, font_size) as u32;
-                let box_w = tw.max(200) + 32;
-                let box_h = if show_engines { 80 } else { 40 };
+
+                // Calculate button widths to size the box properly
+                let btn_widths: Vec<u32> = if show_engines && !search_engine_names.is_empty() {
+                    search_engine_names.iter()
+                        .map(|name| text_width(fonts, name, btn_font_size) as u32 + 16)
+                        .collect()
+                } else {
+                    vec![]
+                };
+                let buttons_total_w = if btn_widths.is_empty() {
+                    0u32
+                } else {
+                    btn_widths.iter().sum::<u32>() + (btn_widths.len() as u32 - 1) * btn_gap as u32
+                };
+
+                // Box width must fit both text and buttons
+                let box_w = tw.max(200).max(buttons_total_w + 32) + 32;
+                let box_h = if show_engines { 88 } else { 40 };
                 let box_x = (w as i32 - box_w as i32) / 2;
                 let box_y = 8;
 
@@ -1711,17 +1729,11 @@ impl App {
                 render_text(canvas, w, h, fonts, &display_text, text_x, text_y, font_size, text_color);
 
                 // Draw search engine buttons if no zoxide match
-                if show_engines && !search_engine_names.is_empty() {
-                    let btn_font_size = 14.0;
-                    let btn_y = box_y + 45;
+                if show_engines && !btn_widths.is_empty() {
+                    let btn_y = box_y + 48;
                     let btn_h = 28u32;
-                    let btn_gap = 8i32;
 
-                    // Calculate total width of all buttons
-                    let btn_widths: Vec<u32> = search_engine_names.iter()
-                        .map(|name| text_width(fonts, name, btn_font_size) as u32 + 16)
-                        .collect();
-                    let total_w: i32 = btn_widths.iter().map(|w| *w as i32 + btn_gap).sum::<i32>() - btn_gap;
+                    let total_w = buttons_total_w as i32;
                     let mut btn_x = box_x + (box_w as i32 - total_w) / 2;
 
                     for (i, name) in search_engine_names.iter().enumerate() {
@@ -1880,6 +1892,115 @@ impl KeyboardHandler for App {
                 self.dirty = true;
                 self.request_frame(qh);
             }
+        } else if event.keysym == Keysym::Left {
+            if self.picker_target.is_some() {
+                // Navigate picker left
+                let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
+                let max_idx = visible_count.min(self.icons.len().saturating_sub(self.picker_scroll));
+                if let Some(idx) = self.picker_hovered {
+                    if idx % Self::PICKER_COLS > 0 {
+                        self.picker_hovered = Some(idx - 1);
+                        self.dirty = true;
+                        self.request_frame(qh);
+                    }
+                } else if max_idx > 0 {
+                    self.picker_hovered = Some(0);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            } else if let Some(idx) = self.hovered_tile {
+                // Move tile focus left
+                let col = idx % self.grid_w;
+                if col > 0 {
+                    self.hovered_tile = Some(idx - 1);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            }
+        } else if event.keysym == Keysym::Right {
+            if self.picker_target.is_some() {
+                // Navigate picker right
+                let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
+                let max_idx = visible_count.min(self.icons.len().saturating_sub(self.picker_scroll));
+                if let Some(idx) = self.picker_hovered {
+                    if idx % Self::PICKER_COLS < Self::PICKER_COLS - 1 && idx + 1 < max_idx {
+                        self.picker_hovered = Some(idx + 1);
+                        self.dirty = true;
+                        self.request_frame(qh);
+                    }
+                } else if max_idx > 0 {
+                    self.picker_hovered = Some(0);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            } else if let Some(idx) = self.hovered_tile {
+                // Move tile focus right
+                let col = idx % self.grid_w;
+                let num_tiles = self.grid_w * self.grid_h;
+                if col < self.grid_w - 1 && idx + 1 < num_tiles {
+                    self.hovered_tile = Some(idx + 1);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            }
+        } else if event.keysym == Keysym::Up {
+            if self.picker_target.is_some() {
+                // Navigate picker up (or scroll)
+                if let Some(idx) = self.picker_hovered {
+                    if idx >= Self::PICKER_COLS {
+                        self.picker_hovered = Some(idx - Self::PICKER_COLS);
+                        self.dirty = true;
+                        self.request_frame(qh);
+                    } else if self.picker_scroll > 0 {
+                        // Scroll up
+                        self.picker_scroll = self.picker_scroll.saturating_sub(Self::PICKER_COLS);
+                        self.dirty = true;
+                        self.request_frame(qh);
+                    }
+                } else {
+                    self.picker_hovered = Some(0);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            } else if let Some(idx) = self.hovered_tile {
+                // Move tile focus up
+                if idx >= self.grid_w {
+                    self.hovered_tile = Some(idx - self.grid_w);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            }
+        } else if event.keysym == Keysym::Down {
+            if self.picker_target.is_some() {
+                // Navigate picker down (or scroll)
+                let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
+                let max_idx = visible_count.min(self.icons.len().saturating_sub(self.picker_scroll));
+                let max_scroll = self.icons.len().saturating_sub(visible_count);
+                if let Some(idx) = self.picker_hovered {
+                    if idx + Self::PICKER_COLS < max_idx {
+                        self.picker_hovered = Some(idx + Self::PICKER_COLS);
+                        self.dirty = true;
+                        self.request_frame(qh);
+                    } else if self.picker_scroll < max_scroll {
+                        // Scroll down
+                        self.picker_scroll = (self.picker_scroll + Self::PICKER_COLS).min(max_scroll);
+                        self.dirty = true;
+                        self.request_frame(qh);
+                    }
+                } else if max_idx > 0 {
+                    self.picker_hovered = Some(0);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            } else if let Some(idx) = self.hovered_tile {
+                // Move tile focus down
+                let num_tiles = self.grid_w * self.grid_h;
+                if idx + self.grid_w < num_tiles {
+                    self.hovered_tile = Some(idx + self.grid_w);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            }
         } else if event.keysym == Keysym::Tab {
             // Tab completion for paths
             if self.search_query.contains('/') || self.search_query.starts_with('~') {
@@ -1982,6 +2103,36 @@ impl KeyboardHandler for App {
                     eprintln!("  search {} for: {}", engine.name, self.search_query);
                 }
                 self.exit = true;
+            } else if let Some(target) = self.picker_target {
+                // Picker is open - select hovered item
+                if let Some(picker_idx) = self.picker_hovered {
+                    let icon_idx = self.picker_scroll + picker_idx;
+                    if icon_idx < self.icons.len() {
+                        self.tiles[target] = Some(icon_idx);
+                        eprintln!("  picker: selected {} for tile {}", self.icons[icon_idx].name, target);
+                    }
+                }
+                self.picker_target = None;
+                self.picker_hovered = None;
+                self.dirty = true;
+                self.request_frame(qh);
+            } else if let Some(tile_idx) = self.hovered_tile {
+                // No search query, no picker - check tile
+                if let Some(Some(icon_idx)) = self.tiles.get(tile_idx) {
+                    // Tile has icon - launch it
+                    if let Some(icon) = self.icons.get(*icon_idx) {
+                        launch_exec(&icon.exec, &icon.name);
+                        self.exit = true;
+                    }
+                } else {
+                    // Empty tile - open picker
+                    eprintln!("  picker: opening for tile {}", tile_idx);
+                    self.picker_target = Some(tile_idx);
+                    self.picker_scroll = 0;
+                    self.picker_hovered = Some(0);  // Start with first item selected
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
             }
         } else if let Some(c) = event.utf8.as_ref().and_then(|s| s.chars().next()) {
             // Printable character - add to search

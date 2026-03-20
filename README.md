@@ -1,22 +1,42 @@
 # wlgrid
-Tired of letters everywhere on your screen? Not enough launchers to choose from in the linux ecosystem? 
 
-introducing ...
-
-A blazing fast grid-based win10-nostalgic launcher for Wayland in rust. click and drag. right click remove. click empty tile to add. fully customizeable bottom bar
+A fast grid-based launcher for Wayland, inspired by Windows 10's Start menu. Built in Rust.
 
 ![screenshot](screenshot.png)
 
+## Features
 
-## config.toml
-```shell
-mode = "grid"   # "fuzzel" or "grid"
-alpha = 0.08 # only for fuzzel mode, this is forgetting factor 
-width = 6 # in icons 
+**Mouse**
+- Click and drag to rearrange tiles
+- Right-click to remove a tile
+- Click empty tile to open app picker
+
+**Keyboard**
+- Arrow keys to navigate tiles
+- Enter to launch focused app
+- Type to search:
+  - Matches zoxide directories first
+  - Falls back to search engines
+  - Paths with `/` or `~` get tab completion and open directly
+
+**Bottom bar**
+- Customizable quick-action buttons (logout, reboot, etc.)
+
+## Config
+
+`~/.config/wlgrid/config.toml`
+
+```toml
+width = 7
 height = 6
-opacity = 1
-icon_size = 42.0
-custom_entries = []
+opacity = 1.0
+
+search_engines = """
+Brave = https://search.brave.com/search?q={}
+Claude = https://claude.ai/new?q={}
+DuckDuckGo = https://duckduckgo.com/?q={}
+"""
+
 [bottom_bar]
 font = 30
 options = """
@@ -27,3 +47,8 @@ options = """
 󰤄 = systemctl suspend
 """
 ```
+
+## Dependencies
+
+- Wayland compositor
+- zoxide (optional, for directory matching)

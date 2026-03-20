@@ -1880,10 +1880,93 @@ impl KeyboardHandler for App {
                 self.dirty = true;
                 self.request_frame(qh);
             }
+        } else if event.keysym == Keysym::Tab {
+            // Tab completion for paths
+            if self.search_query.contains('/') || self.search_query.starts_with('~') {
+                // Expand tilde to home directory
+                let expanded_path = if self.search_query.starts_with('~') {
+                    if let Some(home) = std::env::var_os("HOME") {
+                        self.search_query.replacen('~', &home.to_string_lossy(), 1)
+                    } else {
+                        self.search_query.clone()
+                    }
+                } else {
+                    self.search_query.clone()
+                };
+
+                // Find parent directory and prefix
+                if let Some(last_slash) = expanded_path.rfind('/') {
+                    let parent = if last_slash == 0 { "/" } else { &expanded_path[..last_slash] };
+                    let prefix = &expanded_path[last_slash + 1..];
+
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        let mut matches: Vec<String> = entries
+                            .filter_map(|e| e.ok())
+                            .filter_map(|e| {
+                                let name = e.file_name().to_string_lossy().to_string();
+                                if name.starts_with(prefix) {
+                                    let full_path = if parent == "/" {
+                                        format!("/{}", name)
+                                    } else {
+                                        format!("{}/{}", parent, name)
+                                    };
+                                    // Add trailing slash for directories
+                                    if e.path().is_dir() {
+                                        Some(format!("{}/", full_path))
+                                    } else {
+                                        Some(full_path)
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        matches.sort();
+                        if let Some(first_match) = matches.first() {
+                            // Keep the ~ prefix if original had it
+                            self.search_query = if self.search_query.starts_with('~') {
+                                if let Some(home) = std::env::var_os("HOME") {
+                                    first_match.replacen(&home.to_string_lossy().to_string(), "~", 1)
+                                } else {
+                                    first_match.clone()
+                                }
+                            } else {
+                                first_match.clone()
+                            };
+                            eprintln!("  tab complete: '{}'", self.search_query);
+                            self.dirty = true;
+                            self.request_frame(qh);
+                        }
+                    }
+                }
+            }
         } else if event.keysym == Keysym::Return {
             // Open best matching directory, or use first search engine if no match
             if !self.search_query.is_empty() {
-                if let Some(dir) = self.find_best_zoxide_match() {
+                // If it looks like a path (contains / or starts with ~), open it directly
+                if self.search_query.contains('/') || self.search_query.starts_with('~') {
+                    // Expand tilde to home directory
+                    let path = if self.search_query.starts_with('~') {
+                        if let Some(home) = std::env::var_os("HOME") {
+                            self.search_query.replacen('~', &home.to_string_lossy(), 1)
+                        } else {
+                            self.search_query.clone()
+                        }
+                    } else {
+                        self.search_query.clone()
+                    };
+                    // Add to zoxide
+                    let _ = Command::new("zoxide")
+                        .args(["add", &path])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    eprintln!("  zoxide add: {}", path);
+                    // Open with preferred editor (same as zoxide matches)
+                    self.open_directory(&path);
+                } else if let Some(dir) = self.find_best_zoxide_match() {
                     let dir = dir.to_string();
                     self.open_directory(&dir);
                 } else if let Some(engine) = self.search_engines.first() {
@@ -1902,7 +1985,7 @@ impl KeyboardHandler for App {
             }
         } else if let Some(c) = event.utf8.as_ref().and_then(|s| s.chars().next()) {
             // Printable character - add to search
-            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '/' || c == '.' || c == '~' {
                 self.search_query.push(c);
                 eprintln!("  search: '{}'", self.search_query);
                 self.dirty = true;

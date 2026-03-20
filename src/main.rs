@@ -470,6 +470,7 @@ use wayland_client::{
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
+use wayland_cursor::CursorTheme;
 
 // ── desktop entry + icon loading ──
 
@@ -700,25 +701,6 @@ fn load_svg_rgba(data: &[u8], target_size: u32) -> Option<(Vec<u8>, u32, u32)> {
     Some((pixmap.take(), target_size, target_size))
 }
 
-/// Wake up the cursor by jiggling it (for compositors that hide cursor on inactivity)
-fn wake_cursor() {
-    // Jiggle pattern: +1, -2, +1 (nets to 0)
-    let jiggle = |dx: i32| {
-        Command::new("ydotool")
-            .args(["mousemove", "-x", &dx.to_string(), "-y", "0"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .and_then(|mut c| c.wait())
-    };
-
-    if jiggle(1).is_ok() {
-        let _ = jiggle(-2);
-        let _ = jiggle(1);
-        eprintln!("  cursor: woke via ydotool");
-    }
-}
-
 /// Launch an application from its Exec string (without shell - secure)
 fn launch_exec(exec: &str, name: &str) {
     eprintln!("  launch: raw exec = '{}'", exec);
@@ -906,8 +888,10 @@ fn main() {
 
     let pool = SlotPool::new((surface_w * surface_h * 4) as usize, &shm).expect("pool alloc failed");
 
-    // Wake up the cursor (in case it's hidden from inactivity)
-    wake_cursor();
+    // Load cursor theme for setting cursor on pointer enter
+    let cursor_theme = CursorTheme::load(&conn, shm.wl_shm().clone(), 24).ok();
+    let cursor_surface = compositor.create_surface(&qh);
+    eprintln!("  cursor theme loaded: {}", cursor_theme.is_some());
 
     // Try to load from cache first (fast path)
     let (icons, fonts) = if let Some(cache) = load_cache() {
@@ -1015,6 +999,9 @@ fn main() {
         fonts,
         opacity,
         search_query: String::new(),
+        cursor_theme,
+        cursor_surface,
+        pointer_enter_serial: 0,
     };
 
     loop {
@@ -1086,6 +1073,10 @@ struct App {
     opacity: f32,
     // Search state
     search_query: String,
+    // Cursor
+    cursor_theme: Option<CursorTheme>,
+    cursor_surface: wl_surface::WlSurface,
+    pointer_enter_serial: u32,
 }
 
 impl App {
@@ -1586,13 +1577,31 @@ impl KeyboardHandler for App {
 }
 
 impl PointerHandler for App {
-    fn pointer_frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+    fn pointer_frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, pointer: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         let t0 = Instant::now();
         let mut needs_redraw = false;
         let event_count = events.len();
 
         for ev in events {
             if &ev.surface != self.layer.wl_surface() { continue; }
+
+            // Handle pointer enter - set cursor to make it visible
+            if let PointerEventKind::Enter { serial } = ev.kind {
+                self.pointer_enter_serial = serial;
+                // Set cursor from theme
+                if let Some(ref mut cursor_theme) = self.cursor_theme {
+                    if let Some(cursor) = cursor_theme.get_cursor("default") {
+                        let image = &cursor[0];
+                        let (hx, hy) = image.hotspot();
+                        let (w, h) = image.dimensions();
+                        self.cursor_surface.attach(Some(image), 0, 0);
+                        self.cursor_surface.damage_buffer(0, 0, w as i32, h as i32);
+                        self.cursor_surface.commit();
+                        pointer.set_cursor(serial, Some(&self.cursor_surface), hx as i32, hy as i32);
+                        eprintln!("  cursor: set via wl_pointer.set_cursor");
+                    }
+                }
+            }
 
             // If picker is open, handle picker interactions
             if self.picker_target.is_some() {

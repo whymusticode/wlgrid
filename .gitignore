@@ -1,4 +1,4 @@
 /target
 .cargo-home/
 flake.lock
-result/**
+result

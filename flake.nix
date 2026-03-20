@@ -27,8 +27,6 @@
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
 
-            # Only build the layer binary
-            cargoBuildFlags = [ "--bin" "wlgrid-layer" ];
 
             nativeBuildInputs = with pkgs; [
               pkg-config

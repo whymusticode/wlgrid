@@ -48,6 +48,49 @@ options = """
 """
 ```
 
+## Installation
+
+### Debian/Ubuntu
+
+```bash
+# Build dependencies
+sudo apt install build-essential cargo libwayland-dev libxkbcommon-dev
+
+# Build and install
+git clone https://github.com/whymusticode/wlgrid
+cd wlgrid
+cargo build --release
+sudo cp target/release/wlgrid /usr/local/bin/
+```
+
+### Arch Linux
+
+```bash
+# Build dependencies
+sudo pacman -S rust wayland libxkbcommon
+
+# Build and install
+git clone https://github.com/whymusticode/wlgrid
+cd wlgrid
+cargo build --release
+sudo cp target/release/wlgrid /usr/local/bin/
+```
+
+### Nix
+
+```bash
+# Run directly
+nix run github:whymusticode/wlgrid
+
+# Or install in a shell
+nix shell github:whymusticode/wlgrid
+
+# Or add to your flake inputs
+{
+  inputs.wlgrid.url = "github:whymusticode/wlgrid";
+}
+```
+
 ## Dependencies
 
 - Wayland compositor

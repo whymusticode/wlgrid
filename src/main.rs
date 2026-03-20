@@ -21,6 +21,39 @@ struct Config {
     opacity: Option<f32>,
     #[serde(default)]
     bottom_bar: Option<BottomBar>,
+    #[serde(default)]
+    search_engines: Option<String>,
+}
+
+#[derive(Clone)]
+struct SearchEngine {
+    name: String,
+    url_template: String, // use {} for query placeholder
+}
+
+fn default_search_engines() -> Vec<SearchEngine> {
+    vec![
+        SearchEngine { name: "Brave".into(), url_template: "https://search.brave.com/search?q={}".into() },
+        SearchEngine { name: "Claude".into(), url_template: "https://claude.ai/new?q={}".into() },
+        SearchEngine { name: "Wikipedia".into(), url_template: "https://en.wikipedia.org/wiki/Special:Search?search={}".into() },
+        SearchEngine { name: "GitHub".into(), url_template: "https://github.com/search?q={}".into() },
+        SearchEngine { name: "YouTube".into(), url_template: "https://www.youtube.com/results?search_query={}".into() },
+    ]
+}
+
+fn parse_search_engines(config_str: &str) -> Vec<SearchEngine> {
+    config_str
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() { return None; }
+            let (name, url) = line.split_once('=')?;
+            Some(SearchEngine {
+                name: name.trim().to_string(),
+                url_template: url.trim().to_string(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -701,6 +734,28 @@ fn load_svg_rgba(data: &[u8], target_size: u32) -> Option<(Vec<u8>, u32, u32)> {
     Some((pixmap.take(), target_size, target_size))
 }
 
+/// Load recent directories from zoxide
+fn load_zoxide_dirs() -> Vec<String> {
+    let output = Command::new("zoxide")
+        .args(["query", "-l"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let dirs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect();
+            eprintln!("  zoxide: loaded {} directories", dirs.len());
+            dirs
+        }
+        _ => {
+            eprintln!("  zoxide: failed to load (is zoxide installed?)");
+            Vec::new()
+        }
+    }
+}
+
 /// Launch an application from its Exec string (without shell - secure)
 fn launch_exec(exec: &str, name: &str) {
     eprintln!("  launch: raw exec = '{}'", exec);
@@ -999,6 +1054,13 @@ fn main() {
         fonts,
         opacity,
         search_query: String::new(),
+        zoxide_dirs: load_zoxide_dirs(),
+        search_engines: config.search_engines
+            .as_ref()
+            .map(|s| parse_search_engines(s))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(default_search_engines),
+        hovered_search_engine: None,
         cursor_theme,
         cursor_surface,
         pointer_enter_serial: 0,
@@ -1071,8 +1133,11 @@ struct App {
     fonts: Option<Fonts>,
     // Appearance
     opacity: f32,
-    // Search state
+    // Search state (zoxide directories)
     search_query: String,
+    zoxide_dirs: Vec<String>,
+    search_engines: Vec<SearchEngine>,
+    hovered_search_engine: Option<usize>,
     // Cursor
     cursor_theme: Option<CursorTheme>,
     cursor_surface: wl_surface::WlSurface,
@@ -1119,11 +1184,13 @@ impl App {
         if y < dock_y as f64 || y >= (dock_y as f64 + DOCK_HEIGHT as f64) {
             return None;
         }
-        // Use the same spacing-based hit test as the rendering
+        // Smaller hitboxes (60% of spacing, centered) to prevent accidental clicks
         let item_spacing = self.width / self.dock.len() as u32;
+        let hitbox_width = (item_spacing as f64 * 0.6) as u32;
+        let hitbox_margin = (item_spacing - hitbox_width) / 2;
         for i in 0..self.dock.len() {
-            let start_x = i as u32 * item_spacing;
-            let end_x = start_x + item_spacing;
+            let start_x = i as u32 * item_spacing + hitbox_margin;
+            let end_x = start_x + hitbox_width;
             if x >= start_x as f64 && x < end_x as f64 {
                 return Some(i);
             }
@@ -1187,19 +1254,91 @@ impl App {
         None
     }
 
-    fn find_best_match(&self) -> Option<&Icon> {
+    fn find_best_zoxide_match(&self) -> Option<&str> {
         if self.search_query.is_empty() {
             return None;
         }
         let query = self.search_query.to_lowercase();
 
-        // First try exact prefix match
-        if let Some(icon) = self.icons.iter().find(|i| i.name.to_lowercase().starts_with(&query)) {
-            return Some(icon);
+        // Search by directory name (last component) or full path
+        // First try exact match on directory name
+        if let Some(dir) = self.zoxide_dirs.iter().find(|d| {
+            d.rsplit('/').next().unwrap_or(d).to_lowercase().starts_with(&query)
+        }) {
+            return Some(dir);
         }
 
-        // Then try contains match
-        self.icons.iter().find(|i| i.name.to_lowercase().contains(&query))
+        // Then try contains match on full path
+        self.zoxide_dirs.iter().find(|d| d.to_lowercase().contains(&query)).map(|s| s.as_str())
+    }
+
+    fn search_engine_at(&self, x: f64, y: f64) -> Option<usize> {
+        // Only active when search query exists and no zoxide match
+        if self.search_query.is_empty() || self.find_best_zoxide_match().is_some() {
+            return None;
+        }
+
+        let fonts = self.fonts.as_ref()?;
+        let w = self.width;
+
+        let font_size = 24.0;
+        let tw = text_width(fonts, &self.search_query, font_size) as u32;
+        let box_w = tw.max(200) + 32;
+        let box_x = (w as i32 - box_w as i32) / 2;
+        let box_y = 8;
+
+        let btn_font_size = 14.0;
+        let btn_y = box_y + 45;
+        let btn_h = 28i32;
+        let btn_gap = 8i32;
+
+        // Check if y is in button row
+        if y < btn_y as f64 || y >= (btn_y + btn_h) as f64 {
+            return None;
+        }
+
+        // Calculate button positions
+        let btn_widths: Vec<u32> = self.search_engines.iter()
+            .map(|e| text_width(fonts, &e.name, btn_font_size) as u32 + 16)
+            .collect();
+        let total_w: i32 = btn_widths.iter().map(|w| *w as i32 + btn_gap).sum::<i32>() - btn_gap;
+        let mut btn_x = box_x + (box_w as i32 - total_w) / 2;
+
+        for (i, btn_w) in btn_widths.iter().enumerate() {
+            if x >= btn_x as f64 && x < (btn_x + *btn_w as i32) as f64 {
+                return Some(i);
+            }
+            btn_x += *btn_w as i32 + btn_gap;
+        }
+        None
+    }
+
+    fn open_directory(&self, dir: &str) {
+        // Open with vscodium/code (preferred for dirs and text files)
+        let editors = ["codium", "code", "vscodium"];
+
+        for editor in editors {
+            if Command::new(editor)
+                .arg(dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                eprintln!("  opening {} with {}", dir, editor);
+                return;
+            }
+        }
+
+        // Fallback to xdg-open
+        let _ = Command::new("xdg-open")
+            .arg(dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        eprintln!("  opening {} with xdg-open", dir);
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
@@ -1255,18 +1394,26 @@ impl App {
         let hovered_dock = self.hovered_dock;
         let dock_y = if self.dock.is_empty() { 0 } else { self.dock_bar_y() };
 
-        // Pre-compute search box data
-        let search_data: Option<(String, bool)> = if !self.search_query.is_empty() {
-            let best_match = self.find_best_match();
-            let display_text = if let Some(icon) = best_match {
-                format!("{} → {}", self.search_query, icon.name)
+        // Pre-compute search box data (zoxide directories)
+        // Returns: (query_text, has_zoxide_match, show_search_engines)
+        let search_data: Option<(String, bool, bool)> = if !self.search_query.is_empty() {
+            let best_match = self.find_best_zoxide_match();
+            let display_text = if let Some(dir) = best_match {
+                let short = dir.rsplit('/').next().unwrap_or(dir);
+                format!("{} → {}", self.search_query, short)
             } else {
-                format!("{} (no match)", self.search_query)
+                self.search_query.clone()
             };
-            Some((display_text, best_match.is_some()))
+            Some((display_text, best_match.is_some(), best_match.is_none()))
         } else {
             None
         };
+
+        // Pre-compute search engine button data
+        let search_engine_names: Vec<String> = self.search_engines.iter()
+            .map(|e| e.name.clone())
+            .collect();
+        let hovered_search_engine = self.hovered_search_engine;
 
         let t1 = Instant::now();
         eprintln!("  draw: precompute {:.2}ms", (t1 - t0).as_secs_f64() * 1000.0);
@@ -1279,24 +1426,98 @@ impl App {
         let t2 = Instant::now();
         eprintln!("  draw: create_buffer {:.2}ms", (t2 - t1).as_secs_f64() * 1000.0);
 
-        // Clear to dark background with opacity (BGRA)
+        // Aero Glass style background with gradient (BGRA)
         let bg_alpha = (self.opacity * 255.0) as u8;
-        canvas.chunks_exact_mut(4).for_each(|chunk| {
-            chunk.copy_from_slice(&[0x12, 0x12, 0x12, bg_alpha]);
-        });
+        for y in 0..h {
+            // Vertical gradient: lighter at top, darker at bottom
+            // With a subtle blue/purple tint for that obsidian look
+            let t = y as f32 / h as f32;
+            let base = 0x10 + ((1.0 - t) * 0x10 as f32) as u8; // 0x20 at top, 0x10 at bottom
+            let b = base + 4; // slight blue tint
+            let g = base;
+            let r = base + 2; // tiny bit of warmth
+
+            let row_start = (y * w * 4) as usize;
+            for x in 0..w {
+                let idx = row_start + (x * 4) as usize;
+                canvas[idx] = b;
+                canvas[idx + 1] = g;
+                canvas[idx + 2] = r;
+                canvas[idx + 3] = bg_alpha;
+            }
+        }
+
+        // Top shine line (bright highlight for glass effect)
+        for x in 0..w {
+            let idx = (x * 4) as usize;
+            canvas[idx] = 0x60;     // B
+            canvas[idx + 1] = 0x58; // G
+            canvas[idx + 2] = 0x50; // R
+            canvas[idx + 3] = bg_alpha;
+        }
 
         let t3 = Instant::now();
         eprintln!("  draw: clear {:.2}ms", (t3 - t2).as_secs_f64() * 1000.0);
 
-        // Draw grid of tiles
+        // Draw grid of tiles with glass bevel effect
         for (i, tx, ty, icon_idx) in &draw_list {
-            // Tile background - lighter when hovered, with opacity
-            let bg_color = if hovered == Some(*i) {
-                [0x46, 0x46, 0x46, bg_alpha]
-            } else {
-                [0x2D, 0x2D, 0x2D, bg_alpha]
-            };
-            fill_rect(canvas, w, h, *tx, *ty, tile_size, tile_size, bg_color);
+            let is_hovered = hovered == Some(*i);
+
+            // Tile background with gradient (lighter at top for glass effect)
+            for row in 0..tile_size {
+                let py = *ty + row as i32;
+                if py < 0 || py >= h as i32 { continue; }
+
+                // Gradient within tile: brighter at top
+                let t = row as f32 / tile_size as f32;
+                let (base_top, base_bot) = if is_hovered {
+                    (0x55u8, 0x38u8)
+                } else {
+                    (0x40u8, 0x25u8)
+                };
+                let base = base_top - ((t * (base_top - base_bot) as f32) as u8);
+                let b = base + 3; // subtle blue
+                let g = base;
+                let r = base + 1;
+
+                for col in 0..tile_size {
+                    let px = *tx + col as i32;
+                    if px < 0 || px >= w as i32 { continue; }
+                    let idx = ((py as u32 * w + px as u32) * 4) as usize;
+                    canvas[idx] = b;
+                    canvas[idx + 1] = g;
+                    canvas[idx + 2] = r;
+                    canvas[idx + 3] = bg_alpha;
+                }
+            }
+
+            // Top edge highlight (glass shine)
+            for col in 0..tile_size {
+                let px = *tx + col as i32;
+                if px < 0 || px >= w as i32 { continue; }
+                let py = *ty;
+                if py >= 0 && py < h as i32 {
+                    let idx = ((py as u32 * w + px as u32) * 4) as usize;
+                    canvas[idx] = 0x70;     // B - brighter
+                    canvas[idx + 1] = 0x68; // G
+                    canvas[idx + 2] = 0x60; // R
+                    canvas[idx + 3] = bg_alpha;
+                }
+            }
+
+            // Bottom edge shadow
+            for col in 0..tile_size {
+                let px = *tx + col as i32;
+                if px < 0 || px >= w as i32 { continue; }
+                let py = *ty + tile_size as i32 - 1;
+                if py >= 0 && py < h as i32 {
+                    let idx = ((py as u32 * w + px as u32) * 4) as usize;
+                    canvas[idx] = 0x18;
+                    canvas[idx + 1] = 0x15;
+                    canvas[idx + 2] = 0x12;
+                    canvas[idx + 3] = bg_alpha;
+                }
+            }
 
             // Draw icon if present (skip if being dragged)
             if let Some(idx) = icon_idx {
@@ -1313,24 +1534,76 @@ impl App {
         let t4 = Instant::now();
         eprintln!("  draw: tiles {:.2}ms", (t4 - t3).as_secs_f64() * 1000.0);
 
-        // Draw dock bar
+        // Draw dock bar with glass effect
         if !self.dock.is_empty() {
-            // Dock background - slightly lighter, with opacity
-            fill_rect(canvas, w, h, 0, dock_y, w, DOCK_HEIGHT, [0x1A, 0x1A, 0x1A, bg_alpha]);
+            // Dock background with gradient
+            for row in 0..DOCK_HEIGHT {
+                let py = dock_y + row as i32;
+                if py < 0 || py >= h as i32 { continue; }
 
-            // Draw dock items evenly spaced - no boxes, just text
+                let t = row as f32 / DOCK_HEIGHT as f32;
+                let base = 0x18 + ((1.0 - t) * 0x08 as f32) as u8;
+                let b = base + 2;
+                let g = base;
+                let r = base + 1;
+
+                for x in 0..w {
+                    let idx = ((py as u32 * w + x) * 4) as usize;
+                    canvas[idx] = b;
+                    canvas[idx + 1] = g;
+                    canvas[idx + 2] = r;
+                    canvas[idx + 3] = bg_alpha;
+                }
+            }
+
+            // Top separator line (subtle shine)
+            if dock_y >= 0 && dock_y < h as i32 {
+                for x in 0..w {
+                    let idx = ((dock_y as u32 * w + x) * 4) as usize;
+                    canvas[idx] = 0x50;
+                    canvas[idx + 1] = 0x48;
+                    canvas[idx + 2] = 0x40;
+                    canvas[idx + 3] = bg_alpha;
+                }
+            }
+
+            // Draw dock items evenly spaced
             let font_size = self.dock_font_size;
             let item_count = self.dock.len() as u32;
             let item_spacing = w / item_count;
 
             for (i, entry) in self.dock.iter().enumerate() {
                 let center_x = (i as u32 * item_spacing + item_spacing / 2) as i32;
+                let is_hovered = hovered_dock == Some(i);
+                let item_start_x = i as u32 * item_spacing;
+
+                // Full-width hover shading (covers entire item portion)
+                if is_hovered {
+                    for row in 0..DOCK_HEIGHT {
+                        let py = dock_y + row as i32;
+                        if py < 0 || py >= h as i32 { continue; }
+
+                        // Brighter gradient for hovered section
+                        let t = row as f32 / DOCK_HEIGHT as f32;
+                        let base = 0x30 + ((1.0 - t) * 0x15 as f32) as u8;
+
+                        for col in 0..item_spacing {
+                            let px = item_start_x + col;
+                            if px >= w { continue; }
+                            let idx = ((py as u32 * w + px) * 4) as usize;
+                            canvas[idx] = base + 4;     // B
+                            canvas[idx + 1] = base + 2; // G
+                            canvas[idx + 2] = base;     // R
+                            canvas[idx + 3] = bg_alpha;
+                        }
+                    }
+                }
 
                 // Text color: brighter when hovered
-                let text_color = if hovered_dock == Some(i) {
+                let text_color = if is_hovered {
                     [0xFF, 0xFF, 0xFF, 0xFF] // bright white
                 } else {
-                    [0xCC, 0xCC, 0xCC, 0xFF] // slightly dimmer
+                    [0xAA, 0xAA, 0xAA, 0xFF] // dimmer
                 };
 
                 if let Some(ref fonts) = self.fonts {
@@ -1400,29 +1673,82 @@ impl App {
         eprintln!("  draw: picker {:.2}ms", (t6 - t5).as_secs_f64() * 1000.0);
 
         // Draw search box if query is not empty
-        if let Some((display_text, has_match)) = search_data {
+        if let Some((display_text, has_match, show_engines)) = search_data {
             if let Some(ref fonts) = self.fonts {
-                // Draw search box at the top center
                 let font_size = 24.0;
                 let tw = text_width(fonts, &display_text, font_size) as u32;
-                let box_w = tw + 32;
-                let box_h = 40;
+                let box_w = tw.max(200) + 32;
+                let box_h = if show_engines { 80 } else { 40 };
                 let box_x = (w as i32 - box_w as i32) / 2;
                 let box_y = 8;
 
-                // Background
-                fill_rect(canvas, w, h, box_x, box_y, box_w, box_h, [0x00, 0x00, 0x00, 0xDD]);
-                draw_rect_outline(canvas, w, h, box_x, box_y, box_w, box_h, [0x88, 0x88, 0xFF, 0xFF], 2);
+                // Background with glass effect
+                for row in 0..box_h {
+                    let py = box_y + row as i32;
+                    if py < 0 || py >= h as i32 { continue; }
+                    let t = row as f32 / box_h as f32;
+                    let base = 0x18 - (t * 8.0) as u8;
+                    for col in 0..box_w {
+                        let px = box_x + col as i32;
+                        if px < 0 || px >= w as i32 { continue; }
+                        let idx = ((py as u32 * w + px as u32) * 4) as usize;
+                        canvas[idx] = base + 8;
+                        canvas[idx + 1] = base + 4;
+                        canvas[idx + 2] = base;
+                        canvas[idx + 3] = 0xEE;
+                    }
+                }
+                draw_rect_outline(canvas, w, h, box_x, box_y, box_w, box_h, [0x60, 0x60, 0x80, 0xFF], 1);
 
-                // Text
+                // Query text
                 let text_x = box_x + 16;
                 let text_y = box_y + 28;
                 let text_color = if has_match {
                     [0xFF, 0xFF, 0xFF, 0xFF]
                 } else {
-                    [0xFF, 0x88, 0x88, 0xFF]
+                    [0xCC, 0xCC, 0xCC, 0xFF]
                 };
                 render_text(canvas, w, h, fonts, &display_text, text_x, text_y, font_size, text_color);
+
+                // Draw search engine buttons if no zoxide match
+                if show_engines && !search_engine_names.is_empty() {
+                    let btn_font_size = 14.0;
+                    let btn_y = box_y + 45;
+                    let btn_h = 28u32;
+                    let btn_gap = 8i32;
+
+                    // Calculate total width of all buttons
+                    let btn_widths: Vec<u32> = search_engine_names.iter()
+                        .map(|name| text_width(fonts, name, btn_font_size) as u32 + 16)
+                        .collect();
+                    let total_w: i32 = btn_widths.iter().map(|w| *w as i32 + btn_gap).sum::<i32>() - btn_gap;
+                    let mut btn_x = box_x + (box_w as i32 - total_w) / 2;
+
+                    for (i, name) in search_engine_names.iter().enumerate() {
+                        let btn_w = btn_widths[i];
+                        let is_hovered = hovered_search_engine == Some(i);
+
+                        // Button background
+                        let bg_color = if is_hovered {
+                            [0x60, 0x50, 0x40, 0xFF]
+                        } else {
+                            [0x30, 0x28, 0x20, 0xFF]
+                        };
+                        fill_rect(canvas, w, h, btn_x, btn_y, btn_w, btn_h, bg_color);
+
+                        // Button text
+                        let txt_color = if is_hovered {
+                            [0xFF, 0xFF, 0xFF, 0xFF]
+                        } else {
+                            [0xBB, 0xBB, 0xBB, 0xFF]
+                        };
+                        let txt_x = btn_x + 8;
+                        let txt_y = btn_y + 19;
+                        render_text(canvas, w, h, fonts, name, txt_x, txt_y, btn_font_size, txt_color);
+
+                        btn_x += btn_w as i32 + btn_gap;
+                    }
+                }
             }
         }
 
@@ -1555,12 +1881,24 @@ impl KeyboardHandler for App {
                 self.request_frame(qh);
             }
         } else if event.keysym == Keysym::Return {
-            // Launch best match
+            // Open best matching directory, or use first search engine if no match
             if !self.search_query.is_empty() {
-                if let Some(icon) = self.find_best_match() {
-                    launch_exec(&icon.exec, &icon.name);
-                    self.exit = true;
+                if let Some(dir) = self.find_best_zoxide_match() {
+                    let dir = dir.to_string();
+                    self.open_directory(&dir);
+                } else if let Some(engine) = self.search_engines.first() {
+                    // No match - use first search engine
+                    let query = self.search_query.replace(' ', "+");
+                    let url = engine.url_template.replace("{}", &query);
+                    let _ = Command::new("xdg-open")
+                        .arg(&url)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    eprintln!("  search {} for: {}", engine.name, self.search_query);
                 }
+                self.exit = true;
             }
         } else if let Some(c) = event.utf8.as_ref().and_then(|s| s.chars().next()) {
             // Printable character - add to search
@@ -1687,6 +2025,13 @@ impl PointerHandler for App {
                         needs_redraw = true;
                     }
 
+                    // Update search engine hover state
+                    let new_search_engine_hovered = self.search_engine_at(ev.position.0, ev.position.1);
+                    if new_search_engine_hovered != self.hovered_search_engine {
+                        self.hovered_search_engine = new_search_engine_hovered;
+                        needs_redraw = true;
+                    }
+
                     // Redraw during drag to update icon position
                     if self.drag_from.is_some() {
                         needs_redraw = true;
@@ -1695,11 +2040,26 @@ impl PointerHandler for App {
                 PointerEventKind::Leave { .. } => {
                     self.hovered_tile = None;
                     self.hovered_dock = None;
+                    self.hovered_search_engine = None;
                     needs_redraw = true;
                 }
                 PointerEventKind::Press { button, .. } => {
                     if button == 0x110 { // BTN_LEFT
-                        if let Some(tile) = self.tile_at(ev.position.0, ev.position.1) {
+                        // Check search engine click first
+                        if let Some(engine_idx) = self.search_engine_at(ev.position.0, ev.position.1) {
+                            if let Some(engine) = self.search_engines.get(engine_idx) {
+                                let query = self.search_query.replace(' ', "+");
+                                let url = engine.url_template.replace("{}", &query);
+                                let _ = Command::new("xdg-open")
+                                    .arg(&url)
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                                eprintln!("  search {} for: {}", engine.name, self.search_query);
+                                self.exit = true;
+                            }
+                        } else if let Some(tile) = self.tile_at(ev.position.0, ev.position.1) {
                             self.press_start = Some((ev.position.0, ev.position.1, tile));
                         } else if let Some(dock_idx) = self.dock_item_at(ev.position.0, ev.position.1) {
                             // Click on dock item - launch immediately

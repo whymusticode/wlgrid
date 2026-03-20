@@ -2,3 +2,4 @@
 .cargo-home/
 flake.lock
 result
+Cargo.lock

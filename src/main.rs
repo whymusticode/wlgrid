@@ -18,11 +18,15 @@ struct Config {
     #[serde(default)]
     icon_size: Option<f32>,
     #[serde(default)]
+    opacity: Option<f32>,
+    #[serde(default)]
     bottom_bar: Option<BottomBar>,
 }
 
 #[derive(Deserialize, Default, Clone)]
 struct BottomBar {
+    #[serde(default)]
+    font: Option<f32>,
     #[serde(default)]
     options: String,
 }
@@ -518,10 +522,11 @@ fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
     }
 
     // Search in common icon directories
-    let sizes = ["64x64", "48x48", "96x96", "128x128", "256x256", "scalable", "32x32"];
+    // Prefer PNG over SVG since we can't load SVG; also check common sizes first
+    let sizes = ["48x48", "64x64", "96x96", "128x128", "256x256", "512x512", "32x32", "scalable"];
     let categories = ["apps", "applications"];
     let themes = ["hicolor", "Adwaita", "breeze", "Papirus"];
-    let extensions = ["png", "svg"];
+    let extensions = ["png", "svg", "webp", "jpg", "jpeg"]; // PNG preferred, then SVG
 
     for theme in themes {
         for size in sizes {
@@ -564,6 +569,28 @@ fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
         }
     }
 
+    // Flatpak icons (system and user)
+    let flatpak_dirs = [
+        "/var/lib/flatpak/exports/share/icons",
+    ];
+    let home = env::var("HOME").ok();
+    let user_flatpak = home.as_ref().map(|h| format!("{h}/.local/share/flatpak/exports/share/icons"));
+
+    for base in flatpak_dirs.iter().map(|s| s.to_string()).chain(user_flatpak) {
+        for theme in themes {
+            for size in sizes {
+                for cat in categories {
+                    for ext in extensions {
+                        let path = PathBuf::from(format!(
+                            "{base}/{theme}/{size}/{cat}/{icon_name}.{ext}"
+                        ));
+                        if path.exists() { return Some(path); }
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -575,15 +602,26 @@ fn load_desktop_entries() -> Vec<(DesktopEntry, Vec<u8>, u32, u32)> {
 
     let app_dirs = [
         "/usr/share/applications",
-        "/run/current-system/sw/share/applications", // NixOS
+        "/run/current-system/sw/share/applications", // NixOS system
+        "/var/lib/flatpak/exports/share/applications", // Flatpak system
     ];
 
-    // Also check ~/.local/share/applications
-    let home_apps = env::var("HOME")
-        .map(|h| format!("{h}/.local/share/applications"))
-        .ok();
+    // User-specific directories
+    let home = env::var("HOME").ok();
+    let user = env::var("USER").ok();
 
-    for dir in app_dirs.iter().map(|s| s.to_string()).chain(home_apps) {
+    let mut user_dirs: Vec<String> = Vec::new();
+    if let Some(ref h) = home {
+        user_dirs.push(format!("{h}/.local/share/applications"));
+        user_dirs.push(format!("{h}/.local/share/flatpak/exports/share/applications")); // Flatpak user
+        user_dirs.push(format!("{h}/.nix-profile/share/applications")); // NixOS user profile
+    }
+    if let Some(ref u) = user {
+        user_dirs.push(format!("/etc/profiles/per-user/{u}/share/applications")); // NixOS per-user
+    }
+
+    // Scan user dirs FIRST so user's custom entries take priority over system ones
+    for dir in user_dirs.into_iter().chain(app_dirs.iter().map(|s| s.to_string())) {
         eprintln!("  scanning {}", dir);
         let Ok(read_dir) = std::fs::read_dir(&dir) else { continue };
 
@@ -616,6 +654,12 @@ fn load_desktop_entries() -> Vec<(DesktopEntry, Vec<u8>, u32, u32)> {
 
 fn load_icon_rgba(path: &Path, target_size: u32) -> Option<(Vec<u8>, u32, u32)> {
     let bytes = std::fs::read(path).ok()?;
+
+    // Check if it's an SVG file
+    if path.extension().map_or(false, |e| e == "svg") {
+        return load_svg_rgba(&bytes, target_size);
+    }
+
     let img = image::load_from_memory(&bytes).ok()?;
 
     // Scale to target size if needed
@@ -631,8 +675,35 @@ fn load_icon_rgba(path: &Path, target_size: u32) -> Option<(Vec<u8>, u32, u32)> 
     Some((rgba.into_vec(), w, h))
 }
 
+fn load_svg_rgba(data: &[u8], target_size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    use resvg::usvg::{self, Options, Tree};
+    use resvg::tiny_skia::{self, Pixmap};
+
+    let tree = Tree::from_data(data, &Options::default()).ok()?;
+    let size = tree.size();
+
+    // Create pixmap at target size
+    let mut pixmap = Pixmap::new(target_size, target_size)?;
+
+    // Calculate scale to fit
+    let scale_x = target_size as f32 / size.width();
+    let scale_y = target_size as f32 / size.height();
+    let scale = scale_x.min(scale_y);
+
+    // Center the image
+    let tx = (target_size as f32 - size.width() * scale) / 2.0;
+    let ty = (target_size as f32 - size.height() * scale) / 2.0;
+
+    let transform = tiny_skia::Transform::from_scale(scale, scale).post_translate(tx, ty);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    Some((pixmap.take(), target_size, target_size))
+}
+
 /// Launch an application from its Exec string
 fn launch_exec(exec: &str, name: &str) {
+    eprintln!("  launch: raw exec = '{}'", exec);
+
     // Strip desktop entry field codes (%f, %F, %u, %U, %i, %c, %k, etc.)
     let cmd: String = exec
         .split_whitespace()
@@ -645,7 +716,7 @@ fn launch_exec(exec: &str, name: &str) {
         return;
     }
 
-    eprintln!("  launch: {} -> {}", name, cmd);
+    eprintln!("  launch: {} -> '{}'", name, cmd);
 
     // Spawn detached process
     match Command::new("sh")
@@ -788,6 +859,13 @@ fn main() {
         .collect();
     eprintln!("  loaded {} bottom bar items", dock.len());
 
+    // Get dock font size and opacity from config
+    let dock_font_size = config.bottom_bar.as_ref()
+        .and_then(|bb| bb.font)
+        .unwrap_or(16.0);
+    let opacity = config.opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+    eprintln!("  dock font size: {}, opacity: {}", dock_font_size, opacity);
+
     // Calculate surface size (grid + dock bar if dock has items)
     let surface_w = 16 + grid_w as u32 * tile_size + (grid_w - 1) as u32 * tile_gap;
     let grid_height = 16 + grid_h as u32 * tile_size + (grid_h - 1) as u32 * tile_gap;
@@ -909,7 +987,9 @@ fn main() {
         picker_hovered: None,
         dock,
         hovered_dock: None,
+        dock_font_size,
         fonts,
+        opacity,
     };
 
     loop {
@@ -974,8 +1054,11 @@ struct App {
     // Dock state
     dock: Vec<DockEntry>,
     hovered_dock: Option<usize>,
+    dock_font_size: f32,
     // Fonts for text rendering (text + symbols)
     fonts: Option<Fonts>,
+    // Appearance
+    opacity: f32,
 }
 
 impl App {
@@ -1150,9 +1233,10 @@ impl App {
         let t2 = Instant::now();
         eprintln!("  draw: create_buffer {:.2}ms", (t2 - t1).as_secs_f64() * 1000.0);
 
-        // Clear to dark background (BGRA)
+        // Clear to dark background with opacity (BGRA)
+        let bg_alpha = (self.opacity * 255.0) as u8;
         canvas.chunks_exact_mut(4).for_each(|chunk| {
-            chunk.copy_from_slice(&[0x12, 0x12, 0x12, 0xFF]);
+            chunk.copy_from_slice(&[0x12, 0x12, 0x12, bg_alpha]);
         });
 
         let t3 = Instant::now();
@@ -1160,11 +1244,11 @@ impl App {
 
         // Draw grid of tiles
         for (i, tx, ty, icon_idx) in &draw_list {
-            // Tile background - lighter when hovered
+            // Tile background - lighter when hovered, with opacity
             let bg_color = if hovered == Some(*i) {
-                [0x46, 0x46, 0x46, 0xFF]
+                [0x46, 0x46, 0x46, bg_alpha]
             } else {
-                [0x2D, 0x2D, 0x2D, 0xFF]
+                [0x2D, 0x2D, 0x2D, bg_alpha]
             };
             fill_rect(canvas, w, h, *tx, *ty, tile_size, tile_size, bg_color);
 
@@ -1185,11 +1269,11 @@ impl App {
 
         // Draw dock bar
         if !self.dock.is_empty() {
-            // Dock background - slightly lighter
-            fill_rect(canvas, w, h, 0, dock_y, w, DOCK_HEIGHT, [0x1A, 0x1A, 0x1A, 0xFF]);
+            // Dock background - slightly lighter, with opacity
+            fill_rect(canvas, w, h, 0, dock_y, w, DOCK_HEIGHT, [0x1A, 0x1A, 0x1A, bg_alpha]);
 
             // Draw dock items evenly spaced - no boxes, just text
-            let font_size = 16.0f32;
+            let font_size = self.dock_font_size;
             let item_count = self.dock.len() as u32;
             let item_spacing = w / item_count;
 

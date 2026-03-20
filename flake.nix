@@ -22,11 +22,10 @@
           ];
         in {
           default = pkgs.rustPlatform.buildRustPackage {
-            pname = "wlgrid-layer";
+            pname = "wlgrid";
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-
 
             nativeBuildInputs = with pkgs; [
               pkg-config
@@ -37,7 +36,7 @@
             buildInputs = runtimeLibs;
 
             postFixup = ''
-              patchelf --set-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" $out/bin/wlgrid-layer
+              patchelf --set-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" $out/bin/wlgrid
             '';
 
             meta = {

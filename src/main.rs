@@ -2470,10 +2470,13 @@ impl PointerHandler for App {
                         }
                     }
 
-                    // Update grid hover state
-                    if new_hovered != self.hovered_tile {
-                        self.hovered_tile = new_hovered;
-                        needs_redraw = true;
+                    // Update grid hover state - only change focus when moving to a different tile
+                    // (don't lose focus when moving to empty space between tiles)
+                    if let Some(tile) = new_hovered {
+                        if self.hovered_tile != Some(tile) {
+                            self.hovered_tile = Some(tile);
+                            needs_redraw = true;
+                        }
                     }
 
                     // Update dock hover state
@@ -2495,7 +2498,7 @@ impl PointerHandler for App {
                     }
                 }
                 PointerEventKind::Leave { .. } => {
-                    self.hovered_tile = None;
+                    // Keep tile focus when pointer leaves - only clear dock/search hover
                     self.hovered_dock = None;
                     self.hovered_search_engine = None;
                     needs_redraw = true;

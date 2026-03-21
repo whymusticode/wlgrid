@@ -5,8 +5,9 @@ A fast grid-based launcher for Wayland, inspired by Windows 10's Start menu. Bui
 ![screenshot](screenshot.png)
 
 ## Features
-<100ms time-to-interactive
+<100ms time-to-interactive (FS caching adds randomness)
 designed with tablet/phone use in mind
+
 **Mouse**
 - Click and drag to rearrange tiles
 - Right-click to remove a tile

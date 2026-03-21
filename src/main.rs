@@ -2090,6 +2090,18 @@ impl KeyboardHandler for App {
                 self.dirty = true;
                 self.request_frame(qh);
             }
+        } else if event.keysym == Keysym::Delete {
+            // Delete key removes the focused tile's entry (same as right-click)
+            if self.picker_target.is_none() {
+                if let Some(tile) = self.hovered_tile {
+                    if self.tiles[tile].is_some() {
+                        self.tiles[tile] = None;
+                        eprintln!("  removed tile {} (delete key)", tile);
+                        self.dirty = true;
+                        self.request_frame(qh);
+                    }
+                }
+            }
         } else if event.keysym == Keysym::Left {
             if self.picker_target.is_some() {
                 // Navigate picker left

@@ -766,29 +766,70 @@ fn load_zoxide_dirs() -> Vec<String> {
 }
 
 /// Launch an application from its Exec string (without shell - secure)
+/// Parse a shell-like command string, respecting quoted arguments.
+fn parse_exec_args(exec: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut chars = exec.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+            }
+            '\\' if in_double_quote || (!in_single_quote && !in_double_quote) => {
+                // Handle escape sequences
+                if let Some(&next) = chars.peek() {
+                    chars.next();
+                    current.push(next);
+                }
+            }
+            ' ' | '\t' if !in_single_quote && !in_double_quote => {
+                if !current.is_empty() {
+                    // Skip desktop entry field codes (%f, %F, %u, %U, etc.)
+                    if !current.starts_with('%') || current.len() != 2 {
+                        args.push(current.clone());
+                    }
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Don't forget the last argument
+    if !current.is_empty() && (!current.starts_with('%') || current.len() != 2) {
+        args.push(current);
+    }
+
+    args
+}
+
 fn launch_exec(exec: &str, name: &str) {
     eprintln!("  launch: raw exec = '{}'", exec);
 
-    // Parse exec string: first token is the program, rest are arguments
-    // Strip desktop entry field codes (%f, %F, %u, %U, %i, %c, %k, etc.)
-    let parts: Vec<&str> = exec
-        .split_whitespace()
-        .filter(|s| !s.starts_with('%'))
-        .collect();
+    let args = parse_exec_args(exec);
 
-    if parts.is_empty() {
+    if args.is_empty() {
         eprintln!("  launch: empty command for {}", name);
         return;
     }
 
-    let program = parts[0];
-    let args = &parts[1..];
+    let program = &args[0];
+    let cmd_args = &args[1..];
 
-    eprintln!("  launch: {} -> '{}' {:?}", name, program, args);
+    eprintln!("  launch: {} -> '{}' {:?}", name, program, cmd_args);
 
     // Spawn detached process directly (no shell)
     match Command::new(program)
-        .args(args)
+        .args(cmd_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

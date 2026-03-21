@@ -51,30 +51,23 @@ options = """
 ## Installation
 
 ### Debian/Ubuntu
-
 ```bash
-# Build dependencies
 sudo apt install build-essential cargo libwayland-dev libxkbcommon-dev
-
-# Build and install
-git clone https://github.com/whymusticode/wlgrid
-cd wlgrid
-cargo build --release
-sudo cp target/release/wlgrid /usr/local/bin/
 ```
-
 ### Arch Linux
-
 ```bash
-# Build dependencies
 sudo pacman -S rust wayland libxkbcommon
+```
 
-# Build and install
+
+### Debian/Ubuntu/Arch, most normal distros 
+```bash
 git clone https://github.com/whymusticode/wlgrid
 cd wlgrid
 cargo build --release
 sudo cp target/release/wlgrid /usr/local/bin/
 ```
+
 
 ### Nix
 

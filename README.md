@@ -5,7 +5,8 @@ A fast grid-based launcher for Wayland, inspired by Windows 10's Start menu. Bui
 ![screenshot](screenshot.png)
 
 ## Features
-
+<100ms time-to-interactive
+designed with tablet/phone use in mind
 **Mouse**
 - Click and drag to rearrange tiles
 - Right-click to remove a tile
@@ -16,7 +17,7 @@ A fast grid-based launcher for Wayland, inspired by Windows 10's Start menu. Bui
 - Enter to launch focused app
 - Type to search:
   - Matches zoxide directories first
-  - Falls back to search engines
+  - Falls back to search engines (you don't have to press the search button, "enter" will automatically execute the first search option in config)
   - Paths with `/` or `~` get tab completion and open directly
 
 **Bottom bar**

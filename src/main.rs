@@ -158,7 +158,7 @@ fn save_state(tiles: &[Option<usize>], icons: &[Icon]) {
 
 // ── binary cache for fast startup ──
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct Cache {
@@ -188,24 +188,9 @@ fn compute_checksum() -> u64 {
 
     let mut hasher = DefaultHasher::new();
 
-    // Hash mtimes of application directories
-    let app_dirs = [
-        "/usr/share/applications",
-        "/run/current-system/sw/share/applications",
-    ];
-
-    for dir in app_dirs {
-        if let Ok(meta) = std::fs::metadata(dir) {
-            if let Ok(mtime) = meta.modified() {
-                mtime.hash(&mut hasher);
-            }
-        }
-    }
-
-    // Hash user applications dir
-    if let Ok(home) = env::var("HOME") {
-        let user_apps = format!("{home}/.local/share/applications");
-        if let Ok(meta) = std::fs::metadata(&user_apps) {
+    // Hash mtimes of all application directories
+    for dir in get_application_dirs() {
+        if let Ok(meta) = std::fs::metadata(&dir) {
             if let Ok(mtime) = meta.modified() {
                 mtime.hash(&mut hasher);
             }
@@ -630,32 +615,51 @@ fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
 
 const ICON_SIZE: u32 = 48; // Unified icon size for grid and picker
 
+/// Get application directories from XDG_DATA_DIRS and user directories.
+/// User directories come first for priority.
+fn get_application_dirs() -> Vec<String> {
+    let mut dirs = Vec::new();
+
+    // User directories first (higher priority)
+    if let Ok(home) = env::var("HOME") {
+        // XDG_DATA_HOME defaults to ~/.local/share
+        let data_home = env::var("XDG_DATA_HOME")
+            .unwrap_or_else(|_| format!("{home}/.local/share"));
+        dirs.push(format!("{data_home}/applications"));
+
+        // Flatpak user apps
+        dirs.push(format!("{home}/.local/share/flatpak/exports/share/applications"));
+        // NixOS user profile
+        dirs.push(format!("{home}/.nix-profile/share/applications"));
+    }
+
+    // NixOS per-user profile
+    if let Ok(user) = env::var("USER") {
+        dirs.push(format!("/etc/profiles/per-user/{user}/share/applications"));
+    }
+
+    // XDG_DATA_DIRS - system directories
+    let data_dirs = env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+
+    for dir in data_dirs.split(':') {
+        if !dir.is_empty() {
+            dirs.push(format!("{dir}/applications"));
+        }
+    }
+
+    // Flatpak system apps (may not be in XDG_DATA_DIRS)
+    dirs.push("/var/lib/flatpak/exports/share/applications".to_string());
+
+    dirs
+}
+
 fn load_desktop_entries() -> Vec<(DesktopEntry, Vec<u8>, u32, u32)> {
     let mut entries = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
-    let app_dirs = [
-        "/usr/share/applications",
-        "/run/current-system/sw/share/applications", // NixOS system
-        "/var/lib/flatpak/exports/share/applications", // Flatpak system
-    ];
-
-    // User-specific directories
-    let home = env::var("HOME").ok();
-    let user = env::var("USER").ok();
-
-    let mut user_dirs: Vec<String> = Vec::new();
-    if let Some(ref h) = home {
-        user_dirs.push(format!("{h}/.local/share/applications"));
-        user_dirs.push(format!("{h}/.local/share/flatpak/exports/share/applications")); // Flatpak user
-        user_dirs.push(format!("{h}/.nix-profile/share/applications")); // NixOS user profile
-    }
-    if let Some(ref u) = user {
-        user_dirs.push(format!("/etc/profiles/per-user/{u}/share/applications")); // NixOS per-user
-    }
-
-    // Scan user dirs FIRST so user's custom entries take priority over system ones
-    for dir in user_dirs.into_iter().chain(app_dirs.iter().map(|s| s.to_string())) {
+    // Scan directories (user dirs first for priority)
+    for dir in get_application_dirs() {
         eprintln!("  scanning {}", dir);
         let Ok(read_dir) = std::fs::read_dir(&dir) else { continue };
 
@@ -664,20 +668,25 @@ fn load_desktop_entries() -> Vec<(DesktopEntry, Vec<u8>, u32, u32)> {
             if path.extension().map_or(true, |e| e != "desktop") { continue; }
 
             let Some(de) = parse_desktop_file(&path) else { continue };
-            if de.icon_name.is_empty() { continue; }
             if seen_names.contains(&de.name) { continue; }
 
-            let Some(icon_path) = find_icon_file(&de.icon_name) else {
+            // Try to load icon, use empty placeholder if not found
+            let (pixels, w, h) = if de.icon_name.is_empty() {
+                eprintln!("    {} - no icon specified", de.name);
+                (vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize], ICON_SIZE, ICON_SIZE)
+            } else if let Some(icon_path) = find_icon_file(&de.icon_name) {
+                if let Some((p, w, h)) = load_icon_rgba(&icon_path, ICON_SIZE) {
+                    eprintln!("    {} - scaled to {}x{}", de.name, w, h);
+                    (p, w, h)
+                } else {
+                    eprintln!("    {} - failed to load {}", de.name, icon_path.display());
+                    (vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize], ICON_SIZE, ICON_SIZE)
+                }
+            } else {
                 eprintln!("    {} - icon '{}' not found", de.name, de.icon_name);
-                continue;
+                (vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize], ICON_SIZE, ICON_SIZE)
             };
 
-            let Some((pixels, w, h)) = load_icon_rgba(&icon_path, ICON_SIZE) else {
-                eprintln!("    {} - failed to load {}", de.name, icon_path.display());
-                continue;
-            };
-
-            eprintln!("    {} - scaled to {}x{}", de.name, w, h);
             seen_names.insert(de.name.clone());
             entries.push((de, pixels, w, h));
         }
@@ -867,6 +876,8 @@ fn fill_rect(
 }
 
 fn main() {
+    let startup_time = Instant::now();
+
     // ── env probe ──
     eprintln!("=== wlgrid layer-shell probe ===");
     for k in [
@@ -1038,6 +1049,7 @@ fn main() {
         tile_gap,
         tiles,
         icons,
+        icons_checksum: compute_checksum(),
         pointer_pos: (0.0, 0.0),
         hovered_tile: Some(0),  // start with first tile focused
         press_start: None,
@@ -1048,6 +1060,7 @@ fn main() {
         picker_target: None,
         picker_scroll: 0,
         picker_hovered: None,
+        picker_search: String::new(),
         dock,
         hovered_dock: None,
         dock_font_size,
@@ -1064,6 +1077,7 @@ fn main() {
         cursor_theme,
         cursor_surface,
         pointer_enter_serial: 0,
+        startup_time,
     };
 
     loop {
@@ -1112,6 +1126,7 @@ struct App {
     // Grid state: which tiles have icons (index into icons vec)
     tiles: Vec<Option<usize>>,
     icons: Vec<Icon>,
+    icons_checksum: u64,  // checksum when icons were loaded
     // Pointer state (Phase 3 & 4)
     pointer_pos: (f64, f64),
     hovered_tile: Option<usize>,  // shared by mouse and keyboard
@@ -1124,7 +1139,8 @@ struct App {
     // Picker state
     picker_target: Option<usize>,    // which tile we're picking for (None = closed)
     picker_scroll: usize,            // scroll offset in picker list
-    picker_hovered: Option<usize>,   // which picker item is hovered (icon index)
+    picker_hovered: Option<usize>,   // which picker item is hovered (visual index)
+    picker_search: String,           // search filter for picker
     // Dock state
     dock: Vec<DockEntry>,
     hovered_dock: Option<usize>,
@@ -1142,6 +1158,8 @@ struct App {
     cursor_theme: Option<CursorTheme>,
     cursor_surface: wl_surface::WlSurface,
     pointer_enter_serial: u32,
+    // Startup timing
+    startup_time: Instant,
 }
 
 impl App {
@@ -1207,30 +1225,97 @@ impl App {
         }
     }
 
+    /// Check if desktop entries have changed and reload icons if so.
+    /// Returns true if icons were reloaded.
+    fn refresh_icons_if_needed(&mut self) -> bool {
+        let current_checksum = compute_checksum();
+        if current_checksum == self.icons_checksum {
+            return false;
+        }
+
+        eprintln!("  picker: desktop entries changed, reloading icons");
+
+        // Save current tile -> name mappings before reload
+        let tile_names: Vec<Option<String>> = self.tiles.iter()
+            .map(|opt| opt.and_then(|idx| self.icons.get(idx).map(|i| i.name.clone())))
+            .collect();
+
+        // Reload desktop entries
+        let desktop_entries = load_desktop_entries();
+        self.icons = desktop_entries
+            .into_iter()
+            .map(|(de, pixels, w, h)| Icon {
+                name: de.name,
+                exec: de.exec,
+                pixels,
+                width: w,
+                height: h,
+            })
+            .collect();
+        eprintln!("  picker: reloaded {} icons", self.icons.len());
+
+        // Remap tiles by name
+        for (i, opt_name) in tile_names.iter().enumerate() {
+            self.tiles[i] = opt_name.as_ref().and_then(|name| {
+                self.icons.iter().position(|icon| &icon.name == name)
+            });
+        }
+
+        // Update stored checksum
+        self.icons_checksum = current_checksum;
+
+        // Save new cache (without font paths since we don't have them here)
+        save_cache(&self.icons, None, None);
+
+        true
+    }
+
     // Picker constants
-    const PICKER_ITEM_SIZE: u32 = 48;
-    const PICKER_ITEM_GAP: u32 = 4;
-    const PICKER_COLS: usize = 4;
-    const PICKER_VISIBLE_ROWS: usize = 3;
+    const PICKER_ITEM_WIDTH: u32 = 80;   // wider to fit text
+    const PICKER_ITEM_HEIGHT: u32 = 72;  // taller for icon + text
+    const PICKER_ITEM_GAP: u32 = 8;
+    const PICKER_COLS: usize = 6;
+    const PICKER_VISIBLE_ROWS: usize = 5;
+    const PICKER_SEARCH_HEIGHT: u32 = 32;
 
     fn picker_rect(&self) -> (i32, i32, u32, u32) {
         // Center the picker in the surface
         let cols = Self::PICKER_COLS as u32;
         let rows = Self::PICKER_VISIBLE_ROWS as u32;
-        let pw = 16 + cols * Self::PICKER_ITEM_SIZE + (cols - 1) * Self::PICKER_ITEM_GAP;
-        let ph = 16 + rows * Self::PICKER_ITEM_SIZE + (rows - 1) * Self::PICKER_ITEM_GAP;
+        let pw = 16 + cols * Self::PICKER_ITEM_WIDTH + (cols - 1) * Self::PICKER_ITEM_GAP;
+        let ph = 16 + Self::PICKER_SEARCH_HEIGHT + 8 + rows * Self::PICKER_ITEM_HEIGHT + (rows - 1) * Self::PICKER_ITEM_GAP;
         let px = (self.width as i32 - pw as i32) / 2;
         let py = (self.height as i32 - ph as i32) / 2;
         (px, py, pw, ph)
     }
 
+    fn picker_items_y(&self) -> i32 {
+        let (_, py, _, _) = self.picker_rect();
+        py + 8 + Self::PICKER_SEARCH_HEIGHT as i32 + 8
+    }
+
     fn picker_item_rect(&self, index: usize) -> (i32, i32, u32, u32) {
-        let (px, py, _, _) = self.picker_rect();
+        let (px, _, _, _) = self.picker_rect();
+        let items_y = self.picker_items_y();
         let col = index % Self::PICKER_COLS;
         let row = index / Self::PICKER_COLS;
-        let x = px + 8 + (col as u32 * (Self::PICKER_ITEM_SIZE + Self::PICKER_ITEM_GAP)) as i32;
-        let y = py + 8 + (row as u32 * (Self::PICKER_ITEM_SIZE + Self::PICKER_ITEM_GAP)) as i32;
-        (x, y, Self::PICKER_ITEM_SIZE, Self::PICKER_ITEM_SIZE)
+        let x = px + 8 + (col as u32 * (Self::PICKER_ITEM_WIDTH + Self::PICKER_ITEM_GAP)) as i32;
+        let y = items_y + (row as u32 * (Self::PICKER_ITEM_HEIGHT + Self::PICKER_ITEM_GAP)) as i32;
+        (x, y, Self::PICKER_ITEM_WIDTH, Self::PICKER_ITEM_HEIGHT)
+    }
+
+    /// Returns indices of icons matching the picker search filter
+    fn filtered_icon_indices(&self) -> Vec<usize> {
+        if self.picker_search.is_empty() {
+            (0..self.icons.len()).collect()
+        } else {
+            let query = self.picker_search.to_lowercase();
+            self.icons.iter()
+                .enumerate()
+                .filter(|(_, icon)| icon.name.to_lowercase().contains(&query))
+                .map(|(i, _)| i)
+                .collect()
+        }
     }
 
     fn picker_item_at(&self, x: f64, y: f64) -> Option<usize> {
@@ -1241,14 +1326,15 @@ impl App {
             return None;
         }
         // Check each visible item
+        let filtered = self.filtered_icon_indices();
         let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
         for i in 0..visible_count {
-            let icon_idx = self.picker_scroll + i;
-            if icon_idx >= self.icons.len() { break; }
+            let filtered_idx = self.picker_scroll + i;
+            if filtered_idx >= filtered.len() { break; }
             let (ix, iy, iw, ih) = self.picker_item_rect(i);
             if x >= ix as f64 && x < (ix + iw as i32) as f64 &&
                y >= iy as f64 && y < (iy + ih as i32) as f64 {
-                return Some(icon_idx);
+                return Some(i);  // Return visual index, not icon index
             }
         }
         None
@@ -1373,19 +1459,23 @@ impl App {
         });
 
         // Pre-compute picker data
-        let picker_data = if self.picker_target.is_some() {
+        // Returns: (rect, hovered_visual_idx, items: Vec<(icon_idx, name, rect)>, search_text)
+        let picker_data: Option<((i32, i32, u32, u32), Option<usize>, Vec<(usize, String, (i32, i32, u32, u32))>, String)> = if self.picker_target.is_some() {
             let rect = self.picker_rect();
             let picker_hovered = self.picker_hovered;
             let picker_scroll = self.picker_scroll;
+            let filtered = self.filtered_icon_indices();
             let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
             let items: Vec<_> = (0..visible_count)
                 .filter_map(|i| {
-                    let icon_idx = picker_scroll + i;
-                    if icon_idx >= self.icons.len() { return None; }
-                    Some((icon_idx, self.picker_item_rect(i)))
+                    let filtered_idx = picker_scroll + i;
+                    if filtered_idx >= filtered.len() { return None; }
+                    let icon_idx = filtered[filtered_idx];
+                    let name = self.icons[icon_idx].name.clone();
+                    Some((icon_idx, name, self.picker_item_rect(i)))
                 })
                 .collect();
-            Some((rect, picker_hovered, items))
+            Some((rect, picker_hovered, items, self.picker_search.clone()))
         } else {
             None
         };
@@ -1635,7 +1725,7 @@ impl App {
         eprintln!("  draw: drag overlay {:.2}ms", (t5 - t4).as_secs_f64() * 1000.0);
 
         // Draw picker if open
-        if let Some(((px, py, pw, ph), picker_hovered, items)) = picker_data {
+        if let Some(((px, py, pw, ph), picker_hovered, items, search_text)) = picker_data {
             // Dim background
             for y_pos in 0..h {
                 for x_pos in 0..w {
@@ -1650,21 +1740,79 @@ impl App {
             fill_rect(canvas, w, h, px, py, pw, ph, [0x1A, 0x1A, 0x1A, 0xFF]);
             draw_rect_outline(canvas, w, h, px, py, pw, ph, [0x55, 0x55, 0x55, 0xFF], 2);
 
+            // Draw search box at top
+            let search_box_y = py + 8;
+            let search_box_w = pw - 16;
+            fill_rect(canvas, w, h, px + 8, search_box_y, search_box_w, Self::PICKER_SEARCH_HEIGHT, [0x2D, 0x2D, 0x2D, 0xFF]);
+            draw_rect_outline(canvas, w, h, px + 8, search_box_y, search_box_w, Self::PICKER_SEARCH_HEIGHT, [0x55, 0x55, 0x55, 0xFF], 1);
+            if let Some(ref fonts) = self.fonts {
+                let display = if search_text.is_empty() { "Type to search...".to_string() } else { search_text };
+                let color = if self.picker_search.is_empty() { [0x88, 0x88, 0x88, 0xFF] } else { [0xFF, 0xFF, 0xFF, 0xFF] };
+                render_text(canvas, w, h, fonts, &display, px + 12, search_box_y + 22, 16.0, color);
+            }
+
             // Draw picker items
-            for (icon_idx, (ix, iy, iw, ih)) in items {
+            let name_font_size = 10.0;
+            for (visual_idx, (icon_idx, name, (ix, iy, iw, ih))) in items.iter().enumerate() {
                 // Item background (highlight if hovered)
-                let bg = if picker_hovered == Some(icon_idx) {
+                let bg = if picker_hovered == Some(visual_idx) {
                     [0x46, 0x46, 0x46, 0xFF]
                 } else {
                     [0x2D, 0x2D, 0x2D, 0xFF]
                 };
-                fill_rect(canvas, w, h, ix, iy, iw, ih, bg);
+                fill_rect(canvas, w, h, *ix, *iy, *iw, *ih, bg);
 
-                // Draw icon
-                if let Some(icon) = self.icons.get(icon_idx) {
-                    let ox = ix + (iw as i32 - icon.width as i32) / 2;
-                    let oy = iy + (ih as i32 - icon.height as i32) / 2;
+                // Draw icon (centered horizontally, at top of cell)
+                if let Some(icon) = self.icons.get(*icon_idx) {
+                    let ox = ix + (*iw as i32 - icon.width as i32) / 2;
+                    let oy = *iy + 4;  // 4px from top
                     blit_rgba(canvas, w, h, &icon.pixels, icon.width, icon.height, ox, oy);
+                }
+
+                // Draw app name below icon
+                if let Some(ref fonts) = self.fonts {
+                    // Truncate name to fit
+                    let max_chars = 10;
+                    let display_name: String = if name.chars().count() > max_chars {
+                        format!("{}…", &name.chars().take(max_chars - 1).collect::<String>())
+                    } else {
+                        name.clone()
+                    };
+                    let tw = text_width(fonts, &display_name, name_font_size);
+                    let text_x = ix + (*iw as i32 - tw as i32) / 2;
+                    let text_y = iy + *ih as i32 - 4;  // 4px from bottom
+                    render_text(canvas, w, h, fonts, &display_name, text_x, text_y, name_font_size, [0xCC, 0xCC, 0xCC, 0xFF]);
+                }
+            }
+
+            // Draw tooltip for hovered item (on top of everything)
+            if let Some(hovered_idx) = picker_hovered {
+                if let Some((_, name, (ix, iy, iw, _ih))) = items.get(hovered_idx) {
+                    // Only show tooltip if name was truncated
+                    if name.chars().count() > 10 {
+                        if let Some(ref fonts) = self.fonts {
+                            let tooltip_font_size = 12.0;
+                            let tw = text_width(fonts, name, tooltip_font_size) as u32;
+                            let padding = 6u32;
+                            let tooltip_w = tw + padding * 2;
+                            let tooltip_h = 20u32;
+
+                            // Position tooltip above the item, centered
+                            let tooltip_x = ix + (*iw as i32 - tooltip_w as i32) / 2;
+                            let tooltip_y = *iy - tooltip_h as i32 - 4;
+
+                            // Clamp to picker bounds
+                            let tooltip_x = tooltip_x.max(px + 4).min(px + pw as i32 - tooltip_w as i32 - 4);
+                            let tooltip_y = tooltip_y.max(py + 4);
+
+                            // Draw tooltip background
+                            fill_rect(canvas, w, h, tooltip_x, tooltip_y, tooltip_w, tooltip_h, [0x00, 0x00, 0x00, 0xEE]);
+                            draw_rect_outline(canvas, w, h, tooltip_x, tooltip_y, tooltip_w, tooltip_h, [0x88, 0x88, 0x88, 0xFF], 1);
+
+                            // Draw tooltip text
+                            render_text(canvas, w, h, fonts, name, tooltip_x + padding as i32, tooltip_y + 15, tooltip_font_size, [0xFF, 0xFF, 0xFF, 0xFF]);
+                        }
+                    }
                 }
             }
         }
@@ -1840,6 +1988,7 @@ impl LayerShellHandler for App {
             self.first_configure = false;
             eprintln!("  configured {}x{}, drawing first frame", self.width, self.height);
             self.draw(qh);
+            eprintln!("  Time to interactive: {:.2}ms", self.startup_time.elapsed().as_secs_f64() * 1000.0);
         }
     }
 }
@@ -1879,6 +2028,7 @@ impl KeyboardHandler for App {
                 eprintln!("  picker: closed (escape)");
                 self.picker_target = None;
                 self.picker_hovered = None;
+                self.picker_search.clear();
                 self.dirty = true;
                 self.request_frame(qh);
             } else {
@@ -1886,7 +2036,14 @@ impl KeyboardHandler for App {
                 self.exit = true;
             }
         } else if event.keysym == Keysym::BackSpace {
-            if !self.search_query.is_empty() {
+            if self.picker_target.is_some() && !self.picker_search.is_empty() {
+                self.picker_search.pop();
+                self.picker_scroll = 0;  // Reset scroll when search changes
+                self.picker_hovered = Some(0);
+                eprintln!("  picker search: '{}'", self.picker_search);
+                self.dirty = true;
+                self.request_frame(qh);
+            } else if !self.search_query.is_empty() {
                 self.search_query.pop();
                 eprintln!("  search: '{}'", self.search_query);
                 self.dirty = true;
@@ -1895,8 +2052,9 @@ impl KeyboardHandler for App {
         } else if event.keysym == Keysym::Left {
             if self.picker_target.is_some() {
                 // Navigate picker left
+                let filtered_len = self.filtered_icon_indices().len();
                 let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
-                let max_idx = visible_count.min(self.icons.len().saturating_sub(self.picker_scroll));
+                let max_idx = visible_count.min(filtered_len.saturating_sub(self.picker_scroll));
                 if let Some(idx) = self.picker_hovered {
                     if idx % Self::PICKER_COLS > 0 {
                         self.picker_hovered = Some(idx - 1);
@@ -1920,8 +2078,9 @@ impl KeyboardHandler for App {
         } else if event.keysym == Keysym::Right {
             if self.picker_target.is_some() {
                 // Navigate picker right
+                let filtered_len = self.filtered_icon_indices().len();
                 let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
-                let max_idx = visible_count.min(self.icons.len().saturating_sub(self.picker_scroll));
+                let max_idx = visible_count.min(filtered_len.saturating_sub(self.picker_scroll));
                 if let Some(idx) = self.picker_hovered {
                     if idx % Self::PICKER_COLS < Self::PICKER_COLS - 1 && idx + 1 < max_idx {
                         self.picker_hovered = Some(idx + 1);
@@ -1973,9 +2132,10 @@ impl KeyboardHandler for App {
         } else if event.keysym == Keysym::Down {
             if self.picker_target.is_some() {
                 // Navigate picker down (or scroll)
+                let filtered_len = self.filtered_icon_indices().len();
                 let visible_count = Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS;
-                let max_idx = visible_count.min(self.icons.len().saturating_sub(self.picker_scroll));
-                let max_scroll = self.icons.len().saturating_sub(visible_count);
+                let max_idx = visible_count.min(filtered_len.saturating_sub(self.picker_scroll));
+                let max_scroll = filtered_len.saturating_sub(visible_count);
                 if let Some(idx) = self.picker_hovered {
                     if idx + Self::PICKER_COLS < max_idx {
                         self.picker_hovered = Some(idx + Self::PICKER_COLS);
@@ -2105,15 +2265,18 @@ impl KeyboardHandler for App {
                 self.exit = true;
             } else if let Some(target) = self.picker_target {
                 // Picker is open - select hovered item
-                if let Some(picker_idx) = self.picker_hovered {
-                    let icon_idx = self.picker_scroll + picker_idx;
-                    if icon_idx < self.icons.len() {
+                if let Some(visual_idx) = self.picker_hovered {
+                    let filtered = self.filtered_icon_indices();
+                    let filtered_idx = self.picker_scroll + visual_idx;
+                    if filtered_idx < filtered.len() {
+                        let icon_idx = filtered[filtered_idx];
                         self.tiles[target] = Some(icon_idx);
                         eprintln!("  picker: selected {} for tile {}", self.icons[icon_idx].name, target);
                     }
                 }
                 self.picker_target = None;
                 self.picker_hovered = None;
+                self.picker_search.clear();
                 self.dirty = true;
                 self.request_frame(qh);
             } else if let Some(tile_idx) = self.hovered_tile {
@@ -2126,10 +2289,12 @@ impl KeyboardHandler for App {
                     }
                 } else {
                     // Empty tile - open picker
+                    self.refresh_icons_if_needed();
                     eprintln!("  picker: opening for tile {}", tile_idx);
                     self.picker_target = Some(tile_idx);
                     self.picker_scroll = 0;
                     self.picker_hovered = Some(0);  // Start with first item selected
+                    self.picker_search.clear();
                     self.dirty = true;
                     self.request_frame(qh);
                 }
@@ -2137,8 +2302,16 @@ impl KeyboardHandler for App {
         } else if let Some(c) = event.utf8.as_ref().and_then(|s| s.chars().next()) {
             // Printable character - add to search
             if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '/' || c == '.' || c == '~' {
-                self.search_query.push(c);
-                eprintln!("  search: '{}'", self.search_query);
+                if self.picker_target.is_some() {
+                    // Picker is open - filter by name
+                    self.picker_search.push(c);
+                    self.picker_scroll = 0;  // Reset scroll when search changes
+                    self.picker_hovered = Some(0);
+                    eprintln!("  picker search: '{}'", self.picker_search);
+                } else {
+                    self.search_query.push(c);
+                    eprintln!("  search: '{}'", self.search_query);
+                }
                 self.dirty = true;
                 self.request_frame(qh);
             }
@@ -2188,20 +2361,28 @@ impl PointerHandler for App {
                     }
                     PointerEventKind::Press { button, .. } if button == 0x110 => {
                         // Left click in picker
-                        if let Some(icon_idx) = self.picker_item_at(ev.position.0, ev.position.1) {
-                            // Select this icon for the target tile
-                            if let Some(target) = self.picker_target {
-                                self.tiles[target] = Some(icon_idx);
-                                eprintln!("  picker: assigned icon {} to tile {}", icon_idx, target);
+                        if let Some(visual_idx) = self.picker_item_at(ev.position.0, ev.position.1) {
+                            // Convert visual index to icon index
+                            let filtered = self.filtered_icon_indices();
+                            let filtered_idx = self.picker_scroll + visual_idx;
+                            if filtered_idx < filtered.len() {
+                                let icon_idx = filtered[filtered_idx];
+                                // Select this icon for the target tile
+                                if let Some(target) = self.picker_target {
+                                    self.tiles[target] = Some(icon_idx);
+                                    eprintln!("  picker: assigned icon {} to tile {}", self.icons[icon_idx].name, target);
+                                }
                             }
                             self.picker_target = None;
                             self.picker_hovered = None;
+                            self.picker_search.clear();
                             needs_redraw = true;
                         } else {
                             // Clicked outside picker - close it
                             eprintln!("  picker: closed (clicked outside)");
                             self.picker_target = None;
                             self.picker_hovered = None;
+                            self.picker_search.clear();
                             needs_redraw = true;
                         }
                     }
@@ -2209,7 +2390,8 @@ impl PointerHandler for App {
                         // Scroll in picker (use absolute value, positive = down)
                         let scroll_dir = if vertical.absolute > 0.0 { 1 } else if vertical.absolute < 0.0 { -1 } else { 0 };
                         if scroll_dir != 0 {
-                            let max_scroll = self.icons.len().saturating_sub(Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS);
+                            let filtered_len = self.filtered_icon_indices().len();
+                            let max_scroll = filtered_len.saturating_sub(Self::PICKER_COLS * Self::PICKER_VISIBLE_ROWS);
                             if scroll_dir > 0 {
                                 // Scroll down
                                 self.picker_scroll = (self.picker_scroll + Self::PICKER_COLS).min(max_scroll);
@@ -2217,7 +2399,7 @@ impl PointerHandler for App {
                                 // Scroll up
                                 self.picker_scroll = self.picker_scroll.saturating_sub(Self::PICKER_COLS);
                             }
-                            eprintln!("  picker: scroll to {}/{}", self.picker_scroll, self.icons.len());
+                            eprintln!("  picker: scroll to {}/{}", self.picker_scroll, filtered_len);
                             needs_redraw = true;
                         }
                     }
@@ -2319,10 +2501,12 @@ impl PointerHandler for App {
                             // Was a click (no drag happened)
                             if self.tiles[tile].is_none() {
                                 // Empty tile - open picker
+                                self.refresh_icons_if_needed();
                                 eprintln!("  picker: opening for tile {}", tile);
                                 self.picker_target = Some(tile);
                                 self.picker_scroll = 0;
                                 self.picker_hovered = None;
+                                self.picker_search.clear();
                                 needs_redraw = true;
                             } else if let Some(icon_idx) = self.tiles[tile] {
                                 // Filled tile - launch the app

@@ -465,13 +465,14 @@ fn text_width(fonts: &Fonts, text: &str, size: f32) -> f32 {
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
+    delegate_registry, delegate_seat, delegate_shm, delegate_touch,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
         pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        touch::TouchHandler,
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -485,7 +486,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface, wl_touch},
     Connection, QueueHandle,
 };
 use wayland_cursor::CursorTheme;
@@ -1084,6 +1085,9 @@ fn main() {
         layer,
         keyboard: None,
         pointer: None,
+        touch: None,
+        touch_start: None,
+        touch_drag_from: None,
         grid_w,
         grid_h,
         tile_size,
@@ -1159,6 +1163,10 @@ struct App {
     layer: LayerSurface,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
+    touch: Option<wl_touch::WlTouch>,
+    // Touch state
+    touch_start: Option<(f64, f64, usize)>, // (x, y, tile_index) when touch began
+    touch_drag_from: Option<usize>,
     // Grid config
     grid_w: usize,
     grid_h: usize,
@@ -2044,10 +2052,14 @@ impl SeatHandler for App {
         if cap == Capability::Pointer && self.pointer.is_none() {
             self.pointer = Some(self.seat_state.get_pointer(qh, &seat).expect("pointer"));
         }
+        if cap == Capability::Touch && self.touch.is_none() {
+            self.touch = Some(self.seat_state.get_touch(qh, &seat).expect("touch"));
+        }
     }
     fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
         if cap == Capability::Keyboard { self.keyboard.take().map(|k| k.release()); }
         if cap == Capability::Pointer { self.pointer.take().map(|p| p.release()); }
+        if cap == Capability::Touch { self.touch.take().map(|t| t.release()); }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
@@ -2595,6 +2607,149 @@ impl PointerHandler for App {
     }
 }
 
+impl TouchHandler for App {
+    fn down(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_touch::WlTouch, _serial: u32, _time: u32, _surface: wl_surface::WlSurface, _id: i32, position: (f64, f64)) {
+        eprintln!("  touch down at ({:.0}, {:.0})", position.0, position.1);
+
+        // If picker is open, handle picker touch
+        if self.picker_target.is_some() {
+            if let Some(visual_idx) = self.picker_item_at(position.0, position.1) {
+                let filtered = self.filtered_icon_indices();
+                let filtered_idx = self.picker_scroll + visual_idx;
+                if filtered_idx < filtered.len() {
+                    let icon_idx = filtered[filtered_idx];
+                    if let Some(target) = self.picker_target {
+                        self.tiles[target] = Some(icon_idx);
+                        eprintln!("  picker: assigned icon {} to tile {}", self.icons[icon_idx].name, target);
+                    }
+                }
+                self.picker_target = None;
+                self.picker_hovered = None;
+                self.picker_search.clear();
+                self.dirty = true;
+                self.request_frame(qh);
+            } else {
+                // Touched outside picker - close it
+                eprintln!("  picker: closed (touched outside)");
+                self.picker_target = None;
+                self.picker_hovered = None;
+                self.picker_search.clear();
+                self.dirty = true;
+                self.request_frame(qh);
+            }
+            return;
+        }
+
+        // Check search engine touch
+        if let Some(engine_idx) = self.search_engine_at(position.0, position.1) {
+            if let Some(engine) = self.search_engines.get(engine_idx) {
+                let query = self.search_query.replace(' ', "+");
+                let url = engine.url_template.replace("{}", &query);
+                let _ = Command::new("xdg-open")
+                    .arg(&url)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                eprintln!("  search {} for: {}", engine.name, self.search_query);
+                self.exit = true;
+            }
+            return;
+        }
+
+        // Check dock touch
+        if let Some(dock_idx) = self.dock_item_at(position.0, position.1) {
+            if let Some(entry) = self.dock.get(dock_idx) {
+                launch_exec(&entry.exec, &entry.name);
+                self.exit = true;
+            }
+            return;
+        }
+
+        // Check tile touch - record start position for potential drag
+        if let Some(tile) = self.tile_at(position.0, position.1) {
+            self.touch_start = Some((position.0, position.1, tile));
+            self.hovered_tile = Some(tile);
+            self.dirty = true;
+            self.request_frame(qh);
+        }
+    }
+
+    fn up(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_touch::WlTouch, _serial: u32, _time: u32, _id: i32) {
+        eprintln!("  touch up");
+
+        if let Some(from) = self.touch_drag_from.take() {
+            // Was dragging - do the swap
+            if let Some(to) = self.hovered_tile {
+                if from != to {
+                    self.tiles.swap(from, to);
+                    eprintln!("  swapped tile {} <-> {}", from, to);
+                }
+            }
+            self.dirty = true;
+            self.request_frame(qh);
+        } else if let Some((_, _, tile)) = self.touch_start.take() {
+            // Was a tap (no drag)
+            if self.tiles[tile].is_none() {
+                // Empty tile - open picker
+                self.refresh_icons_if_needed();
+                eprintln!("  picker: opening for tile {}", tile);
+                self.picker_target = Some(tile);
+                self.picker_scroll = 0;
+                self.picker_hovered = None;
+                self.picker_search.clear();
+                self.dirty = true;
+                self.request_frame(qh);
+            } else if let Some(icon_idx) = self.tiles[tile] {
+                // Filled tile - launch the app
+                if let Some(icon) = self.icons.get(icon_idx) {
+                    launch_exec(&icon.exec, &icon.name);
+                    self.exit = true;
+                }
+            }
+        }
+        self.touch_start = None;
+    }
+
+    fn motion(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_touch::WlTouch, _time: u32, _id: i32, position: (f64, f64)) {
+        // Check if we should start dragging
+        if let Some((px, py, tile)) = self.touch_start {
+            let dx = position.0 - px;
+            let dy = position.1 - py;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            if dist > self.drag_threshold && self.touch_drag_from.is_none() {
+                self.touch_drag_from = Some(tile);
+                self.touch_start = None;
+                eprintln!("  touch drag start from tile {}", tile);
+                self.dirty = true;
+                self.request_frame(qh);
+            }
+        }
+
+        // Update hover during drag
+        if self.touch_drag_from.is_some() {
+            let new_hovered = self.tile_at(position.0, position.1);
+            if let Some(tile) = new_hovered {
+                if self.hovered_tile != Some(tile) {
+                    self.hovered_tile = Some(tile);
+                    self.dirty = true;
+                    self.request_frame(qh);
+                }
+            }
+        }
+    }
+
+    fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch) {
+        eprintln!("  touch cancel");
+        self.touch_start = None;
+        self.touch_drag_from = None;
+    }
+
+    fn shape(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch, _id: i32, _major: f64, _minor: f64) {}
+    fn orientation(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch, _id: i32, _orientation: f64) {}
+}
+
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm { &mut self.shm }
 }
@@ -2605,6 +2760,7 @@ delegate_shm!(App);
 delegate_seat!(App);
 delegate_keyboard!(App);
 delegate_pointer!(App);
+delegate_touch!(App);
 delegate_layer!(App);
 delegate_registry!(App);
 

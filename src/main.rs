@@ -23,6 +23,40 @@ struct Config {
     bottom_bar: Option<BottomBar>,
     #[serde(default)]
     search_engines: Option<String>,
+    #[serde(default)]
+    search: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SearchType {
+    Folders,  // zoxide directories
+    Desktop,  // desktop entries
+}
+
+fn parse_search_config(config_str: &str) -> Vec<SearchType> {
+    // Parse format like "[folders,desktop]" or "folders,desktop"
+    let cleaned = config_str.trim().trim_start_matches('[').trim_end_matches(']');
+    cleaned
+        .split(',')
+        .filter_map(|s| {
+            match s.trim().to_lowercase().as_str() {
+                "folders" => Some(SearchType::Folders),
+                "desktop" => Some(SearchType::Desktop),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn default_search_types() -> Vec<SearchType> {
+    vec![SearchType::Folders, SearchType::Desktop]
+}
+
+#[derive(Clone)]
+enum SearchMatch {
+    None,
+    Folder(String),
+    Desktop(Vec<usize>),  // indices into icons vec
 }
 
 #[derive(Clone)]
@@ -890,6 +924,66 @@ fn blit_rgba(
     }
 }
 
+/// Blit RGBA source onto ARGB8888 canvas with scaling (nearest neighbor)
+fn blit_rgba_scaled(
+    canvas: &mut [u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_x: i32,
+    dst_y: i32,
+    dst_w: u32,
+    dst_h: u32,
+) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+
+    for dy_offset in 0..dst_h {
+        let dy = dst_y + dy_offset as i32;
+        if dy < 0 || dy >= canvas_h as i32 {
+            continue;
+        }
+        // Map destination y to source y
+        let sy = (dy_offset * src_h / dst_h).min(src_h - 1);
+
+        for dx_offset in 0..dst_w {
+            let dx = dst_x + dx_offset as i32;
+            if dx < 0 || dx >= canvas_w as i32 {
+                continue;
+            }
+            // Map destination x to source x
+            let sx = (dx_offset * src_w / dst_w).min(src_w - 1);
+
+            let src_idx = ((sy * src_w + sx) * 4) as usize;
+            let dst_idx = ((dy as u32 * canvas_w + dx as u32) * 4) as usize;
+
+            // RGBA -> BGRA (little-endian ARGB8888)
+            let r = src[src_idx];
+            let g = src[src_idx + 1];
+            let b = src[src_idx + 2];
+            let a = src[src_idx + 3];
+
+            // Alpha blending with existing pixel
+            if a == 255 {
+                canvas[dst_idx] = b;
+                canvas[dst_idx + 1] = g;
+                canvas[dst_idx + 2] = r;
+                canvas[dst_idx + 3] = a;
+            } else if a > 0 {
+                let alpha = a as u32;
+                let inv_alpha = 255 - alpha;
+                canvas[dst_idx] = ((b as u32 * alpha + canvas[dst_idx] as u32 * inv_alpha) / 255) as u8;
+                canvas[dst_idx + 1] = ((g as u32 * alpha + canvas[dst_idx + 1] as u32 * inv_alpha) / 255) as u8;
+                canvas[dst_idx + 2] = ((r as u32 * alpha + canvas[dst_idx + 2] as u32 * inv_alpha) / 255) as u8;
+                canvas[dst_idx + 3] = 255;
+            }
+        }
+    }
+}
+
 /// Fill a rectangle with solid color (BGRA)
 fn fill_rect(
     canvas: &mut [u8],
@@ -1119,6 +1213,11 @@ fn main() {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(default_search_engines),
         hovered_search_engine: None,
+        search_types: config.search
+            .as_ref()
+            .map(|s| parse_search_config(s))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(default_search_types),
         cursor_theme,
         cursor_surface,
         pointer_enter_serial: 0,
@@ -1203,6 +1302,7 @@ struct App {
     zoxide_dirs: Vec<String>,
     search_engines: Vec<SearchEngine>,
     hovered_search_engine: Option<usize>,
+    search_types: Vec<SearchType>,
     // Cursor
     cursor_theme: Option<CursorTheme>,
     cursor_surface: wl_surface::WlSurface,
@@ -1390,6 +1490,10 @@ impl App {
     }
 
     fn find_best_zoxide_match(&self) -> Option<&str> {
+        // Only search folders if enabled in config
+        if !self.search_types.contains(&SearchType::Folders) {
+            return None;
+        }
         if self.search_query.is_empty() {
             return None;
         }
@@ -1405,6 +1509,64 @@ impl App {
 
         // Then try contains match on full path
         self.zoxide_dirs.iter().find(|d| d.to_lowercase().contains(&query)).map(|s| s.as_str())
+    }
+
+    /// Find desktop entries matching the search query (for main search bar)
+    fn find_desktop_matches(&self) -> Vec<usize> {
+        // Only search desktop entries if enabled in config
+        if !self.search_types.contains(&SearchType::Desktop) {
+            return vec![];
+        }
+        if self.search_query.is_empty() {
+            return vec![];
+        }
+        let query = self.search_query.to_lowercase();
+
+        // First: exact prefix matches on name
+        let mut prefix_matches: Vec<usize> = self.icons.iter()
+            .enumerate()
+            .filter(|(_, icon)| icon.name.to_lowercase().starts_with(&query))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Then: contains matches (excluding already matched)
+        let contains_matches: Vec<usize> = self.icons.iter()
+            .enumerate()
+            .filter(|(i, icon)| {
+                !prefix_matches.contains(i) &&
+                icon.name.to_lowercase().contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        prefix_matches.extend(contains_matches);
+        prefix_matches
+    }
+
+    /// Get the best search result based on configured priority
+    fn find_best_search_match(&self) -> SearchMatch {
+        if self.search_query.is_empty() {
+            return SearchMatch::None;
+        }
+
+        // Iterate through search types in configured priority order
+        for search_type in &self.search_types {
+            match search_type {
+                SearchType::Folders => {
+                    if let Some(dir) = self.find_best_zoxide_match() {
+                        return SearchMatch::Folder(dir.to_string());
+                    }
+                }
+                SearchType::Desktop => {
+                    let matches = self.find_desktop_matches();
+                    if !matches.is_empty() {
+                        return SearchMatch::Desktop(matches);
+                    }
+                }
+            }
+        }
+
+        SearchMatch::None
     }
 
     fn search_engine_at(&self, x: f64, y: f64) -> Option<usize> {
@@ -1533,17 +1695,30 @@ impl App {
         let hovered_dock = self.hovered_dock;
         let dock_y = if self.dock.is_empty() { 0 } else { self.dock_bar_y() };
 
-        // Pre-compute search box data (zoxide directories)
-        // Returns: (query_text, has_zoxide_match, show_search_engines)
-        let search_data: Option<(String, bool, bool)> = if !self.search_query.is_empty() {
-            let best_match = self.find_best_zoxide_match();
-            let display_text = if let Some(dir) = best_match {
-                let short = dir.rsplit('/').next().unwrap_or(dir);
-                format!("{} → {}", self.search_query, short)
-            } else {
-                self.search_query.clone()
-            };
-            Some((display_text, best_match.is_some(), best_match.is_none()))
+        // Pre-compute search box data (unified search: folders + desktop)
+        // Returns: (query_text, has_match, show_search_engines, first_icon_idx)
+        let search_data: Option<(String, bool, bool, Option<usize>)> = if !self.search_query.is_empty() {
+            let best_match = self.find_best_search_match();
+            match best_match {
+                SearchMatch::Folder(ref dir) => {
+                    let short = dir.rsplit('/').next().unwrap_or(dir);
+                    let display_text = format!("{} → {}", self.search_query, short);
+                    Some((display_text, true, false, None))
+                }
+                SearchMatch::Desktop(ref indices) => {
+                    // Show first desktop match in search box with icon
+                    let first_idx = indices.first().copied();
+                    let first_name = first_idx
+                        .and_then(|i| self.icons.get(i))
+                        .map(|icon| icon.name.as_str())
+                        .unwrap_or("");
+                    let display_text = format!("{} → {}", self.search_query, first_name);
+                    Some((display_text, true, false, first_idx))
+                }
+                SearchMatch::None => {
+                    Some((self.search_query.clone(), false, true, None))
+                }
+            }
         } else {
             None
         };
@@ -1870,7 +2045,7 @@ impl App {
         eprintln!("  draw: picker {:.2}ms", (t6 - t5).as_secs_f64() * 1000.0);
 
         // Draw search box if query is not empty
-        if let Some((display_text, has_match, show_engines)) = search_data {
+        if let Some((display_text, has_match, show_engines, first_icon_idx)) = search_data {
             if let Some(ref fonts) = self.fonts {
                 let font_size = 24.0;
                 let btn_font_size = 14.0;
@@ -1891,8 +2066,12 @@ impl App {
                     btn_widths.iter().sum::<u32>() + (btn_widths.len() as u32 - 1) * btn_gap as u32
                 };
 
-                // Box width must fit both text and buttons
-                let box_w = tw.max(200).max(buttons_total_w + 32) + 32;
+                // Icon size for search box (scaled down)
+                let icon_size = 32u32;
+                let icon_padding = if first_icon_idx.is_some() { icon_size + 8 } else { 0 };
+
+                // Box width must fit icon, text, and buttons
+                let box_w = (tw + icon_padding).max(200).max(buttons_total_w + 32) + 32;
                 let box_h = if show_engines { 88 } else { 40 };
                 let box_x = (w as i32 - box_w as i32) / 2;
                 let box_y = 8;
@@ -1915,8 +2094,19 @@ impl App {
                 }
                 draw_rect_outline(canvas, w, h, box_x, box_y, box_w, box_h, [0x60, 0x60, 0x80, 0xFF], 1);
 
-                // Query text
-                let text_x = box_x + 16;
+                // Draw icon if we have a desktop match
+                if let Some(icon_idx) = first_icon_idx {
+                    if let Some(icon) = self.icons.get(icon_idx) {
+                        let icon_x = box_x + 8;
+                        let icon_y = box_y + (box_h as i32 - icon_size as i32) / 2;
+                        // Scale icon to fit
+                        blit_rgba_scaled(canvas, w, h, &icon.pixels, icon.width, icon.height,
+                                        icon_x, icon_y, icon_size, icon_size);
+                    }
+                }
+
+                // Query text (shifted right if icon present)
+                let text_x = box_x + 16 + icon_padding as i32;
                 let text_y = box_y + 28;
                 let text_color = if has_match {
                     [0xFF, 0xFF, 0xFF, 0xFF]
@@ -2288,7 +2478,7 @@ impl KeyboardHandler for App {
                 }
             }
         } else if event.keysym == Keysym::Return {
-            // Open best matching directory, or use first search engine if no match
+            // Open best matching directory/app, or use first search engine if no match
             if !self.search_query.is_empty() {
                 // If it looks like a path (contains / or starts with ~), open it directly
                 if self.search_query.contains('/') || self.search_query.starts_with('~') {
@@ -2312,20 +2502,35 @@ impl KeyboardHandler for App {
                     eprintln!("  zoxide add: {}", path);
                     // Open with preferred editor (same as zoxide matches)
                     self.open_directory(&path);
-                } else if let Some(dir) = self.find_best_zoxide_match() {
-                    let dir = dir.to_string();
-                    self.open_directory(&dir);
-                } else if let Some(engine) = self.search_engines.first() {
-                    // No match - use first search engine
-                    let query = self.search_query.replace(' ', "+");
-                    let url = engine.url_template.replace("{}", &query);
-                    let _ = Command::new("xdg-open")
-                        .arg(&url)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                    eprintln!("  search {} for: {}", engine.name, self.search_query);
+                } else {
+                    // Use unified search with priority order from config
+                    match self.find_best_search_match() {
+                        SearchMatch::Folder(dir) => {
+                            self.open_directory(&dir);
+                        }
+                        SearchMatch::Desktop(indices) => {
+                            // Launch first matching desktop entry
+                            if let Some(&icon_idx) = indices.first() {
+                                if let Some(icon) = self.icons.get(icon_idx) {
+                                    launch_exec(&icon.exec, &icon.name);
+                                }
+                            }
+                        }
+                        SearchMatch::None => {
+                            // No match - use first search engine
+                            if let Some(engine) = self.search_engines.first() {
+                                let query = self.search_query.replace(' ', "+");
+                                let url = engine.url_template.replace("{}", &query);
+                                let _ = Command::new("xdg-open")
+                                    .arg(&url)
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                                eprintln!("  search {} for: {}", engine.name, self.search_query);
+                            }
+                        }
+                    }
                 }
                 self.exit = true;
             } else if let Some(target) = self.picker_target {

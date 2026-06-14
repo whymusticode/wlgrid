@@ -1,0 +1,36 @@
+width = 7 # in icons
+height = 7
+start_col = 3
+start_row = 3
+icon_size = 42.0 # in pixels
+tile_color = "#ffffff"
+
+# FYI toml requires a 0 in front of decimal
+dim = 0.4
+corner_radius = 10
+accent_hue_delta = 18.0
+accent_amount = 1
+panel_color = "#000000"
+panel_alpha = 1.0
+tile_alpha = 0.075
+border_color = "#10130c"
+border_alpha = 0.12
+show_tile_outlines = true 
+
+search = "[desktop,folders]"
+search_engines = """
+Duck = https://duckduckgo.com/?q={}
+Nix = https://search.nixos.org/packages?query={}
+"""   
+
+# good session cleanup is usually custom to your WM, e.g. "swaymsg exit" or "hyprshutdown" 
+[bottom_bar]
+font = 30
+options = """
+󰍃 = swaymsg exit
+󰑓 = systemctl reboot 
+󰐥 = systemctl poweroff 
+󰒲 = systemctl hibernate
+󰤄 = systemctl suspend
+"""
+

@@ -1,0 +1,6 @@
+target/
+.cargo-home/
+
+notes.sh
+.claude/
+user_prompt_history.md 

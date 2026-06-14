@@ -1,0 +1,252 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            mold \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --release --verbose
+
+      - name: cargo test
+        run: cargo test --verbose
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wlgrid-release
+          path: target/release/wlgrid
+          retention-days: 1
+
+  benches:
+    name: Micro-benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            mold \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # We run benches primarily to catch regressions where they fail to
+      # compile or crash. Shared GitHub runners are too noisy (±20-30%) to
+      # meaningfully gate on absolute numbers, so this job just ensures the
+      # bench harness still works; the report is uploaded as an artifact for
+      # humans to eyeball.
+      - name: cargo bench
+        run: cargo bench --no-fail-fast -- --output-format bencher | tee bench-output.txt
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench-output.txt
+            target/criterion/
+
+  headless-smoke:
+    name: Headless first-frame smoke test
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libgl1-mesa-dev \
+            xwayland \
+            sway \
+            imagemagick
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wlgrid-release
+          path: target/release
+
+      - name: Mark binary executable
+        run: chmod +x target/release/wlgrid
+
+      # Three-phase probe under headless sway:
+      #   1. cold   — no cache, no state; exercises the slow load path
+      #   2. warm   — cache present from phase 1; should be noticeably faster
+      #              and have the same icon count
+      #   3. newent — fabricate a new .desktop + icon; cache should detect
+      #              the change, reload, and show one more real icon
+      #
+      # Sway is started once and reused across all three probes.
+      - name: Three-phase probe under headless sway
+        run: |
+          set -u
+          export WLR_BACKENDS=headless
+          export WLR_LIBINPUT_NO_DEVICES=1
+          export WLR_RENDERER=pixman
+          export XDG_RUNTIME_DIR=/tmp/wlgrid-ci-runtime
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+
+          cat > /tmp/sway-ci.conf <<'EOF'
+          output HEADLESS-1 mode 1920x1080
+          xwayland disable
+          EOF
+
+          sway --config /tmp/sway-ci.conf --unsupported-gpu > /tmp/sway.log 2>&1 &
+          SWAY_PID=$!
+          cleanup() {
+            kill $SWAY_PID 2>/dev/null || true
+            wait $SWAY_PID 2>/dev/null || true
+            echo "--- sway log ---"
+            cat /tmp/sway.log 2>/dev/null || true
+            echo "--- end sway log ---"
+          }
+          trap cleanup EXIT
+
+          for i in $(seq 1 100); do
+            sock=$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | head -1 || true)
+            if [ -n "$sock" ]; then break; fi
+            sleep 0.1
+          done
+          if [ -z "${sock:-}" ]; then
+            echo "::error::sway never published a Wayland socket"
+            exit 1
+          fi
+          export WAYLAND_DISPLAY=$(basename "$sock")
+          echo "using WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+
+          run_probe() {
+            label=$1
+            echo "=== probe: $label ==="
+            set +e
+            timeout 20 ./target/release/wlgrid --ci-probe > /tmp/probe-$label.txt 2>&1
+            code=$?
+            set -e
+            cat /tmp/probe-$label.txt
+            return $code
+          }
+
+          get() {
+            label=$1
+            key=$2
+            awk -F= -v k="probe: $key" '$0 ~ "^"k"=" { print $2; exit }' /tmp/probe-$label.txt
+          }
+
+          # GL driver warmup — first EGL init on a cold runner can be slow;
+          # discard this run so it doesn't penalize the cold timing phase.
+          echo "=== probe: gl-warmup ==="
+          timeout 20 ./target/release/wlgrid --ci-probe > /tmp/probe-warmup.txt 2>&1 || true
+          cat /tmp/probe-warmup.txt
+          rm -rf ~/.config/wlgrid
+
+          fail=0
+
+          check_timing() {
+            label=$1 budget=$2
+            t=$(get "$label" time_to_first_frame_ms)
+            if [ "${t:-0}" -gt "$budget" ]; then
+              echo "::error::${label} time_to_first_frame_ms=${t} exceeds ${budget}ms budget"
+              fail=1
+            fi
+          }
+
+          # ─── Phase 1: cold ─────────────────────────────────────────────
+          if ! run_probe cold; then
+            echo "::error::cold probe exited non-zero"; exit 1
+          fi
+          ICONS_COLD=$(get cold icons_loaded)
+          REAL_COLD=$(get cold real_icons_loaded)
+          echo "cold: first_frame=$(get cold time_to_first_frame_ms)ms icons=$ICONS_COLD real=$REAL_COLD"
+          check_timing cold 3000
+          [ "${ICONS_COLD:-0}" -eq 0 ] && { echo "::error::cold icons_loaded=0 — desktop entry scan appears broken"; fail=1; }
+          [ "${REAL_COLD:-0}" -eq 0 ]  && { echo "::error::cold real_icons_loaded=0 — icon loading pipeline appears broken"; fail=1; }
+
+          # ─── Phase 2: warm (cache hit expected) ────────────────────────
+          if ! run_probe warm; then
+            echo "::error::warm probe exited non-zero"; exit 1
+          fi
+          ICONS_WARM=$(get warm icons_loaded)
+          echo "warm: first_frame=$(get warm time_to_first_frame_ms)ms icons=$ICONS_WARM"
+          check_timing warm 100
+          [ "${ICONS_WARM:-0}" -ne "${ICONS_COLD:-0}" ] && { echo "::error::warm icons_loaded=$ICONS_WARM differs from cold=$ICONS_COLD — cache appears broken"; fail=1; }
+
+          # ─── Phase 3: new desktop entry + icon ─────────────────────────
+          mkdir -p ~/.local/share/applications
+          mkdir -p ~/.local/share/icons/hicolor/48x48/apps
+          convert -size 48x48 xc:purple \
+            ~/.local/share/icons/hicolor/48x48/apps/wlgrid-ci-test.png
+          cat > ~/.local/share/applications/wlgrid-ci-test.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=WlgridCITest
+          Exec=/bin/true
+          Icon=wlgrid-ci-test
+          EOF
+
+          if ! run_probe newent; then
+            echo "::error::newent probe exited non-zero"; exit 1
+          fi
+          ICONS_NEW=$(get newent icons_loaded)
+          REAL_NEW=$(get newent real_icons_loaded)
+          echo "newent: first_frame=$(get newent time_to_first_frame_ms)ms icons=$ICONS_NEW real=$REAL_NEW"
+          check_timing newent 200
+          expected=$((ICONS_WARM + 1))
+          [ "${ICONS_NEW:-0}" -ne "$expected" ] && { echo "::error::newent icons_loaded=$ICONS_NEW expected $expected — cache not invalidated on new .desktop"; fail=1; }
+          [ "${REAL_NEW:-0}" -le "${REAL_COLD:-0}" ] && { echo "::error::newent real_icons_loaded=$REAL_NEW did not grow — new icon loaded as placeholder"; fail=1; }
+
+          exit $fail
+
+  lines-of-code:
+    name: Lines of code budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Guards against uncontrolled bloat. The budget is intentionally loose
+      # right now; tighten as the codebase stabilizes. Covers src/ only
+      # (test/ is excluded — test code doesn't contribute to binary bloat).
+      - name: Count Rust LoC
+        run: |
+          total=$(find src -name '*.rs' -type f -exec cat {} + | wc -l)
+          budget=4000
+          echo "Rust LoC: $total (budget: $budget)"
+          if [ "$total" -gt "$budget" ]; then
+            echo "::error::Rust LoC ($total) exceeds budget ($budget)"
+            exit 1
+          fi

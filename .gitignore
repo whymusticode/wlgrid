@@ -3,4 +3,5 @@ target/
 
 notes.sh
 .claude/
+CLAUDE.md
 user_prompt_history.md 

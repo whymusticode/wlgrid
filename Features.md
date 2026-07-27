@@ -17,4 +17,4 @@ TODO: iterate through all the config params and see that they work
 
 pulls nerd font from desktop entry name as icon
 app picker (make sure it scales correctly and can take arrow keys)
-
+writes ~/.config/wlgrid/config.toml if none exists  based on binary bundled config.toml.default 

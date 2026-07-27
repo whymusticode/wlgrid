@@ -3,6 +3,19 @@ name = "wlgrid"
 version = "0.1.0"
 edition = "2024"
 
+# Size mitigations. opt-level stays at 3 — the <100ms time-to-first-frame
+# budget depends on icon decode/resize throughput, so trading speed for size
+# there isn't worth it. fat LTO + a single codegen unit let the linker drop
+# unreachable code across crate boundaries (and generally get *faster* code),
+# abort-on-panic removes the unwind tables and landing pads, and strip drops
+# the symbol table.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
 [dependencies]
 libloading = "0.8"
 smithay-client-toolkit = "0.19"
@@ -15,7 +28,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 resvg = "0.45"
 walkdir = "2"
 ab_glyph = "0.2"
-bincode = "1"
 libc = "0.2"
 glow = "0.17.0"
 khronos-egl = { version = "6.0.0", features = ["dynamic"] }

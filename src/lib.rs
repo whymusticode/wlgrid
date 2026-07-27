@@ -6,7 +6,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use image::GenericImageView;
 use ab_glyph::{Font, FontVec, ScaleFont, point};
-use serde::{Deserialize, Serialize};
 
 // ── debug logging ──────────────────────────────────────────────────────────
 //
@@ -76,31 +75,7 @@ fn sanitize_desktop_exec(exec: &str) -> Option<String> {
     Some(exec.to_string())
 }
 
-// ── binary cache (for fast startup) ────────────────────────────────────────
-
-pub const CACHE_VERSION: u32 = 2;
-
-#[derive(Serialize, Deserialize)]
-pub struct Cache {
-    pub version: u32,
-    pub checksum: u64,
-    pub icons: Vec<CachedIcon>,
-    pub text_font_path: Option<String>,
-    pub symbols_font_path: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct CachedIcon {
-    pub name: String,
-    pub exec: String,
-    pub pixels: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-}
-
-pub fn cache_path() -> Option<PathBuf> {
-    env::var("HOME").ok().map(|h| PathBuf::from(format!("{h}/.config/wlgrid/cache.bin")))
-}
+// ── desktop entry change detection ─────────────────────────────────────────
 
 pub fn compute_checksum() -> u64 {
     // Hash the sorted list of .desktop filenames across all application dirs.
@@ -144,56 +119,7 @@ pub fn compute_checksum() -> u64 {
         }
     }
 
-    CACHE_VERSION.hash(&mut hasher);
-
     hasher.finish()
-}
-
-pub fn load_cache() -> Option<Cache> {
-    let path = cache_path()?;
-    let data = std::fs::read(&path).ok()?;
-    let cache: Cache = bincode::deserialize(&data).ok()?;
-
-    if cache.version != CACHE_VERSION {
-        dlog!("  cache: version mismatch");
-        return None;
-    }
-
-    let expected_checksum = compute_checksum();
-    if cache.checksum != expected_checksum {
-        dlog!("  cache: checksum mismatch");
-        return None;
-    }
-
-    dlog!("  cache: valid, loading {} icons", cache.icons.len());
-    Some(cache)
-}
-
-pub fn save_cache(icons: &[Icon], text_font_path: Option<&Path>, symbols_font_path: Option<&Path>) {
-    let cache = Cache {
-        version: CACHE_VERSION,
-        checksum: compute_checksum(),
-        icons: icons.iter().map(|i| CachedIcon {
-            name: i.name.clone(),
-            exec: i.exec.clone(),
-            pixels: i.pixels.clone(),
-            width: i.width,
-            height: i.height,
-        }).collect(),
-        text_font_path: text_font_path.map(|p| p.to_string_lossy().into_owned()),
-        symbols_font_path: symbols_font_path.map(|p| p.to_string_lossy().into_owned()),
-    };
-
-    if let Some(path) = cache_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(data) = bincode::serialize(&cache) {
-            if std::fs::write(&path, &data).is_ok() {
-                dlog!("  cache: saved {} icons ({} bytes)", cache.icons.len(), data.len());
-            }
-        }
-    }
 }
 
 // ── desktop entry scanning ─────────────────────────────────────────────────
@@ -319,6 +245,18 @@ pub fn find_icon_file(icon_name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Every directory in the tree rooted at `root` (including `root` itself),
+/// or an empty list if `root` doesn't exist. Symlinks are not followed, so a
+/// cyclic link can't send us into an infinite walk.
+fn walk_subdirs(root: &str) -> Vec<String> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_dir())
+        .map(|e| e.path().to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Get application directories from XDG_DATA_DIRS and user directories.
 /// User directories come first for priority.
 pub fn get_application_dirs() -> Vec<String> {
@@ -328,6 +266,11 @@ pub fn get_application_dirs() -> Vec<String> {
         let data_home = env::var("XDG_DATA_HOME")
             .unwrap_or_else(|_| format!("{home}/.local/share"));
         dirs.push(format!("{data_home}/applications"));
+
+        // Wine installs its Start Menu entries under applications/wine/Programs,
+        // nested one directory per vendor/program group. The top-level scan is
+        // non-recursive, so expand that subtree explicitly.
+        dirs.extend(walk_subdirs(&format!("{data_home}/applications/wine/Programs")));
 
         dirs.push(format!("{home}/.local/share/flatpak/exports/share/applications"));
         dirs.push(format!("{home}/.nix-profile/share/applications"));

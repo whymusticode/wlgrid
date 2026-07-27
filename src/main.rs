@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 use std::io::Write;
+use std::thread;
 use serde::{Deserialize, Serialize};
 use ab_glyph::{Font, FontVec, ScaleFont, point};
 mod gpu_gl;
@@ -11,7 +12,7 @@ mod gpu_gl;
 use wlgrid::{
     dlog,
     Icon, Fonts, is_nerd_symbol,
-    compute_checksum,
+    compute_checksum, load_cache, save_cache,
     load_desktop_entries, make_placeholder_icon,
 };
 
@@ -324,9 +325,30 @@ fn save_state(tiles: &[Option<usize>], icons: &[Icon]) {
 
 // ── text rendering ──
 
-/// Search the font directories for a usable text font (and, if present, a
-/// Nerd Font for symbol glyphs).
-fn load_fonts_with_search() -> Option<Fonts> {
+struct FontsWithPaths {
+    fonts: Fonts,
+    text_path: PathBuf,
+    symbols_path: Option<PathBuf>,
+}
+
+/// Load fonts from cached paths (fast path)
+fn load_fonts_from_paths(text_path: &str, symbols_path: Option<&str>) -> Option<Fonts> {
+    let text_bytes = std::fs::read(text_path).ok()?;
+    let text_font = FontVec::try_from_vec(text_bytes).ok()?;
+    dlog!("  cache: loaded text font from {}", text_path);
+
+    let symbols_font = symbols_path.and_then(|p| {
+        let bytes = std::fs::read(p).ok()?;
+        let font = FontVec::try_from_vec(bytes).ok()?;
+        dlog!("  cache: loaded symbols font from {}", p);
+        Some(font)
+    });
+
+    Some(Fonts { text: text_font, symbols: symbols_font })
+}
+
+/// Search for fonts (slow path, used when cache is invalid)
+fn load_fonts_with_search() -> Option<FontsWithPaths> {
     // Common font directories on Linux/NixOS
     let font_dirs = [
         "/run/current-system/sw/share/X11/fonts",
@@ -361,6 +383,7 @@ fn load_fonts_with_search() -> Option<Fonts> {
     // Find text font (prefer DejaVu, Liberation, or any sans)
     let text_patterns = ["DejaVuSans", "LiberationSans", "NotoSans", "Ubuntu", "Roboto"];
     let mut text_font = None;
+    let mut text_path = None;
     for pattern in text_patterns {
         for path in &all_fonts {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -369,6 +392,7 @@ fn load_fonts_with_search() -> Option<Fonts> {
                     if let Ok(font) = FontVec::try_from_vec(bytes) {
                         dlog!("  loaded text font: {}", path.display());
                         text_font = Some(font);
+                        text_path = Some(path.clone());
                         break;
                     }
                 }
@@ -386,6 +410,7 @@ fn load_fonts_with_search() -> Option<Fonts> {
                     if let Ok(font) = FontVec::try_from_vec(bytes) {
                         dlog!("  loaded text font (fallback): {}", path.display());
                         text_font = Some(font);
+                        text_path = Some(path.clone());
                         break;
                     }
                 }
@@ -394,9 +419,11 @@ fn load_fonts_with_search() -> Option<Fonts> {
     }
 
     let text_font = text_font?;
+    let text_path = text_path?;
 
     // Find nerd symbols font
     let mut symbols_font = None;
+    let mut symbols_path = None;
     for path in &all_fonts {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.contains("NerdFont") && name.contains("Symbol") {
@@ -404,13 +431,18 @@ fn load_fonts_with_search() -> Option<Fonts> {
                 if let Ok(font) = FontVec::try_from_vec(bytes) {
                     dlog!("  loaded symbols font: {}", path.display());
                     symbols_font = Some(font);
+                    symbols_path = Some(path.clone());
                     break;
                 }
             }
         }
     }
 
-    Some(Fonts { text: text_font, symbols: symbols_font })
+    Some(FontsWithPaths {
+        fonts: Fonts { text: text_font, symbols: symbols_font },
+        text_path,
+        symbols_path,
+    })
 }
 
 /// Rasterise `text` into a tight RGBA coverage buffer (white pixels, alpha =
@@ -744,12 +776,49 @@ fn main() {
     let cursor_surface = compositor.create_surface(&qh);
     dlog!("  cursor theme deferred");
 
-    // Load fonts first so entries without an icon can render their name.
-    let fonts = load_fonts_with_search();
+    // Try to load from cache first (fast path). Reject it if the cached
+    // icon dimensions don't match the configured icon_size — the user may
+    // have changed `icon_size` in config.toml since the cache was written.
+    let cached = load_cache().filter(|cache| {
+        cache.icons.iter().all(|i| i.width == icon_size && i.height == icon_size)
+    });
+    let mut cache_write_paths: Option<(Option<PathBuf>, Option<PathBuf>)> = None;
+    let (icons, fonts) = if let Some(cache) = cached {
+        // Load icons from cache
+        let icons: Vec<Icon> = cache.icons.into_iter().map(|ci| Icon {
+            name_lower: ci.name.to_lowercase(),
+            name: ci.name,
+            exec: ci.exec,
+            pixels: ci.pixels,
+            width: ci.width,
+            height: ci.height,
+        }).collect();
 
-    // Load desktop entries
-    let icons = load_desktop_entries(icon_size, fonts.as_ref());
-    dlog!("  loaded {} desktop entries", icons.len());
+        // ab_glyph parses lazily (no up-front glyph outlining), so loading the
+        // fonts here is a couple of ms — fine to do synchronously.
+        let fonts = cache.text_font_path.as_ref().and_then(|tp| {
+            load_fonts_from_paths(tp, cache.symbols_font_path.as_deref())
+        });
+
+        dlog!("  cache: loaded {} icons", icons.len());
+        (icons, fonts)
+    } else {
+        // Cache miss - do full load (slow path)
+        dlog!("  cache: miss, doing full load");
+
+        // Load fonts first so entries without an icon can render their name.
+        let (fonts, paths) = match load_fonts_with_search() {
+            Some(fp) => (Some(fp.fonts), (Some(fp.text_path), fp.symbols_path)),
+            None => (None, (None, None)),
+        };
+        cache_write_paths = Some(paths);
+
+        // Load desktop entries
+        let icons = load_desktop_entries(icon_size, fonts.as_ref());
+        dlog!("  loaded {} desktop entries", icons.len());
+
+        (icons, fonts)
+    };
 
     dlog!("  icons + fonts ready at {:.2}ms", startup_time.elapsed().as_secs_f64() * 1000.0);
 
@@ -840,6 +909,7 @@ fn main() {
         cursor_surface,
         pointer_enter_serial: 0,
         startup_time,
+        cache_write_paths,
         probe_draw_ms: Vec::new(),
     };
 
@@ -1105,6 +1175,7 @@ struct App {
     pointer_enter_serial: u32,
     // Startup timing
     startup_time: Instant,
+    cache_write_paths: Option<(Option<PathBuf>, Option<PathBuf>)>,
     probe_draw_ms: Vec<f32>,
 }
 
@@ -1690,6 +1761,9 @@ impl App {
         // Update stored checksum
         self.icons_checksum = current_checksum;
 
+        // Save new cache (without font paths since we don't have them here)
+        save_cache(&self.icons, None, None);
+
         true
     }
 
@@ -1960,6 +2034,16 @@ impl CompositorHandler for App {
         if !self.first_frame_presented {
             self.first_frame_presented = true;
             self.icons_at_first_frame = self.icons.len();
+            if let Some((text_path, symbols_path)) = self.cache_write_paths.take() {
+                let icons = self.icons.clone();
+                thread::spawn(move || {
+                    save_cache(
+                        &icons,
+                        text_path.as_deref(),
+                        symbols_path.as_deref(),
+                    );
+                });
+            }
         }
         if self.dirty {
             self.draw(qh);

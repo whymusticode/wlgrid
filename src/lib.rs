@@ -6,6 +6,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use image::GenericImageView;
 use ab_glyph::{Font, FontVec, ScaleFont, point};
+use serde::{Deserialize, Serialize};
 
 // ── debug logging ──────────────────────────────────────────────────────────
 //
@@ -75,7 +76,31 @@ fn sanitize_desktop_exec(exec: &str) -> Option<String> {
     Some(exec.to_string())
 }
 
-// ── desktop entry change detection ─────────────────────────────────────────
+// ── binary cache (for fast startup) ────────────────────────────────────────
+
+pub const CACHE_VERSION: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+pub struct Cache {
+    pub version: u32,
+    pub checksum: u64,
+    pub icons: Vec<CachedIcon>,
+    pub text_font_path: Option<String>,
+    pub symbols_font_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CachedIcon {
+    pub name: String,
+    pub exec: String,
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn cache_path() -> Option<PathBuf> {
+    env::var("HOME").ok().map(|h| PathBuf::from(format!("{h}/.config/wlgrid/cache.bin")))
+}
 
 pub fn compute_checksum() -> u64 {
     // Hash the sorted list of .desktop filenames across all application dirs.
@@ -119,7 +144,56 @@ pub fn compute_checksum() -> u64 {
         }
     }
 
+    CACHE_VERSION.hash(&mut hasher);
+
     hasher.finish()
+}
+
+pub fn load_cache() -> Option<Cache> {
+    let path = cache_path()?;
+    let data = std::fs::read(&path).ok()?;
+    let cache: Cache = bincode::deserialize(&data).ok()?;
+
+    if cache.version != CACHE_VERSION {
+        dlog!("  cache: version mismatch");
+        return None;
+    }
+
+    let expected_checksum = compute_checksum();
+    if cache.checksum != expected_checksum {
+        dlog!("  cache: checksum mismatch");
+        return None;
+    }
+
+    dlog!("  cache: valid, loading {} icons", cache.icons.len());
+    Some(cache)
+}
+
+pub fn save_cache(icons: &[Icon], text_font_path: Option<&Path>, symbols_font_path: Option<&Path>) {
+    let cache = Cache {
+        version: CACHE_VERSION,
+        checksum: compute_checksum(),
+        icons: icons.iter().map(|i| CachedIcon {
+            name: i.name.clone(),
+            exec: i.exec.clone(),
+            pixels: i.pixels.clone(),
+            width: i.width,
+            height: i.height,
+        }).collect(),
+        text_font_path: text_font_path.map(|p| p.to_string_lossy().into_owned()),
+        symbols_font_path: symbols_font_path.map(|p| p.to_string_lossy().into_owned()),
+    };
+
+    if let Some(path) = cache_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = bincode::serialize(&cache) {
+            if std::fs::write(&path, &data).is_ok() {
+                dlog!("  cache: saved {} icons ({} bytes)", cache.icons.len(), data.len());
+            }
+        }
+    }
 }
 
 // ── desktop entry scanning ─────────────────────────────────────────────────

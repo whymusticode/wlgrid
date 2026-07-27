@@ -105,14 +105,15 @@ jobs:
       - name: Mark binary executable
         run: chmod +x target/release/wlgrid
 
-      # Two-phase probe under headless sway:
-      #   1. base   — clean state; every launch does a full desktop-entry
-      #               scan, and must still come up inside the time budget
-      #   2. newent — fabricate a new .desktop + icon; the next launch should
-      #               pick it up as one more real icon
+      # Three-phase probe under headless sway:
+      #   1. cold   — no cache, no state; exercises the slow load path
+      #   2. warm   — cache present from phase 1; should be noticeably faster
+      #              and have the same icon count
+      #   3. newent — fabricate a new .desktop + icon; cache should detect
+      #              the change, reload, and show one more real icon
       #
-      # Sway is started once and reused across both probes.
-      - name: Two-phase probe under headless sway
+      # Sway is started once and reused across all three probes.
+      - name: Three-phase probe under headless sway
         run: |
           set -u
           export WLR_BACKENDS=headless
@@ -168,7 +169,7 @@ jobs:
           }
 
           # GL driver warmup — first EGL init on a cold runner can be slow;
-          # discard this run so it doesn't penalize the measured phases.
+          # discard this run so it doesn't penalize the cold timing phase.
           echo "=== probe: gl-warmup ==="
           timeout 20 ./target/release/wlgrid --ci-probe > /tmp/probe-warmup.txt 2>&1 || true
           cat /tmp/probe-warmup.txt
@@ -185,16 +186,25 @@ jobs:
             fi
           }
 
-          # ─── Phase 1: base ─────────────────────────────────────────────
-          if ! run_probe base; then
-            echo "::error::base probe exited non-zero"; exit 1
+          # ─── Phase 1: cold ─────────────────────────────────────────────
+          if ! run_probe cold; then
+            echo "::error::cold probe exited non-zero"; exit 1
           fi
-          ICONS_BASE=$(get base icons_loaded)
-          REAL_BASE=$(get base real_icons_loaded)
-          echo "base: first_frame=$(get base time_to_first_frame_ms)ms icons=$ICONS_BASE real=$REAL_BASE"
-          check_timing base 3000
-          [ "${ICONS_BASE:-0}" -eq 0 ] && { echo "::error::base icons_loaded=0 — desktop entry scan appears broken"; fail=1; }
-          [ "${REAL_BASE:-0}" -eq 0 ]  && { echo "::error::base real_icons_loaded=0 — icon loading pipeline appears broken"; fail=1; }
+          ICONS_COLD=$(get cold icons_loaded)
+          REAL_COLD=$(get cold real_icons_loaded)
+          echo "cold: first_frame=$(get cold time_to_first_frame_ms)ms icons=$ICONS_COLD real=$REAL_COLD"
+          check_timing cold 3000
+          [ "${ICONS_COLD:-0}" -eq 0 ] && { echo "::error::cold icons_loaded=0 — desktop entry scan appears broken"; fail=1; }
+          [ "${REAL_COLD:-0}" -eq 0 ]  && { echo "::error::cold real_icons_loaded=0 — icon loading pipeline appears broken"; fail=1; }
+
+          # ─── Phase 2: warm (cache hit expected) ────────────────────────
+          if ! run_probe warm; then
+            echo "::error::warm probe exited non-zero"; exit 1
+          fi
+          ICONS_WARM=$(get warm icons_loaded)
+          echo "warm: first_frame=$(get warm time_to_first_frame_ms)ms icons=$ICONS_WARM"
+          check_timing warm 100
+          [ "${ICONS_WARM:-0}" -ne "${ICONS_COLD:-0}" ] && { echo "::error::warm icons_loaded=$ICONS_WARM differs from cold=$ICONS_COLD — cache appears broken"; fail=1; }
 
           # ─── Phase 3: new desktop entry + icon ─────────────────────────
           mkdir -p ~/.local/share/applications
@@ -215,10 +225,10 @@ jobs:
           ICONS_NEW=$(get newent icons_loaded)
           REAL_NEW=$(get newent real_icons_loaded)
           echo "newent: first_frame=$(get newent time_to_first_frame_ms)ms icons=$ICONS_NEW real=$REAL_NEW"
-          check_timing newent 3000
-          expected=$((ICONS_BASE + 1))
-          [ "${ICONS_NEW:-0}" -ne "$expected" ] && { echo "::error::newent icons_loaded=$ICONS_NEW expected $expected — new .desktop not picked up"; fail=1; }
-          [ "${REAL_NEW:-0}" -le "${REAL_BASE:-0}" ] && { echo "::error::newent real_icons_loaded=$REAL_NEW did not grow — new icon loaded as placeholder"; fail=1; }
+          check_timing newent 200
+          expected=$((ICONS_WARM + 1))
+          [ "${ICONS_NEW:-0}" -ne "$expected" ] && { echo "::error::newent icons_loaded=$ICONS_NEW expected $expected — cache not invalidated on new .desktop"; fail=1; }
+          [ "${REAL_NEW:-0}" -le "${REAL_COLD:-0}" ] && { echo "::error::newent real_icons_loaded=$REAL_NEW did not grow — new icon loaded as placeholder"; fail=1; }
 
           exit $fail
 

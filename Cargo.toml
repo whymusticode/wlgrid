@@ -28,6 +28,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 resvg = "0.45"
 walkdir = "2"
 ab_glyph = "0.2"
+bincode = "1"
 libc = "0.2"
 glow = "0.17.0"
 khronos-egl = { version = "6.0.0", features = ["dynamic"] }

@@ -45,7 +45,7 @@ the gif compressed this so badly, it really does look a lot better:
 
 `~/.config/wlgrid/config.toml`
 
-> Note: wlgrid also stores its tile layout in this folder.
+> Note: wlgrid also stores layout/cache state in this folder.
 
 ```toml
 width = 7 # in icons

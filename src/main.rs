@@ -573,6 +573,18 @@ fn load_zoxide_dirs() -> Vec<String> {
     }
 }
 
+/// Expand the `$USER` placeholder to the current username. This is a plain
+/// string substitution done before spawning (no shell involved), so it only
+/// ever recognizes this one literal token - not general env var expansion.
+fn expand_placeholders(arg: &str) -> String {
+    if arg.contains("$USER") {
+        let user = env::var("USER").unwrap_or_default();
+        arg.replace("$USER", &user)
+    } else {
+        arg.to_string()
+    }
+}
+
 /// Launch an application from its Exec string (without shell - secure)
 /// Parse a shell-like command string, respecting quoted arguments.
 fn parse_exec_args(exec: &str) -> Vec<String> {
@@ -601,7 +613,7 @@ fn parse_exec_args(exec: &str) -> Vec<String> {
                 if !current.is_empty() {
                     // Skip desktop entry field codes (%f, %F, %u, %U, etc.)
                     if !current.starts_with('%') || current.len() != 2 {
-                        args.push(current.clone());
+                        args.push(expand_placeholders(&current));
                     }
                     current.clear();
                 }
@@ -614,7 +626,7 @@ fn parse_exec_args(exec: &str) -> Vec<String> {
 
     // Don't forget the last argument
     if !current.is_empty() && (!current.starts_with('%') || current.len() != 2) {
-        args.push(current);
+        args.push(expand_placeholders(&current));
     }
 
     args

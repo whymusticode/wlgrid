@@ -99,7 +99,7 @@ pub struct CachedIcon {
 }
 
 pub fn cache_path() -> Option<PathBuf> {
-    env::var("HOME").ok().map(|h| PathBuf::from(format!("{h}/.config/wlgrid/cache.bin")))
+    env::var("HOME").ok().map(|h| PathBuf::from(format!("{h}/.cache/wlgrid/cache.bin")))
 }
 
 pub fn compute_checksum() -> u64 {

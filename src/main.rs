@@ -283,7 +283,7 @@ struct AppState {
 }
 
 fn state_path() -> Option<PathBuf> {
-    env::var("HOME").ok().map(|h| PathBuf::from(format!("{h}/.config/wlgrid/state.json")))
+    env::var("HOME").ok().map(|h| PathBuf::from(format!("{h}/.cache/wlgrid/state.json")))
 }
 
 fn load_state() -> AppState {

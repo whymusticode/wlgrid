@@ -13,12 +13,17 @@
           pkgs = import nixpkgs { inherit system; };
           runtimeLibs = with pkgs; [
             wayland
-            libxkbcommon
             mesa
             # libglvnd provides the dlopen'd EGL/GLES dispatcher
             # (libEGL.so.1 / libGLESv2.so.2); mesa only ships the vendor ICD.
             libglvnd
           ];
+          # Statically linked so the binary doesn't depend on the host's
+          # libxkbcommon.so.0 (SONAME/path drift between distros/updates was
+          # the most common "error while loading shared libraries" report).
+          libxkbcommonStatic = pkgs.libxkbcommon.overrideAttrs (old: {
+            mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
+          });
         in {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "wlgrid";
@@ -32,7 +37,7 @@
               clang
             ];
 
-            buildInputs = runtimeLibs;
+            buildInputs = runtimeLibs ++ [ libxkbcommonStatic ];
 
             postFixup = ''
               patchelf --set-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" $out/bin/wlgrid

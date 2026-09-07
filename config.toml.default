@@ -15,7 +15,11 @@ panel_alpha = 1.0
 tile_alpha = 0.075
 border_color = "#10130c"
 border_alpha = 0.12
-show_tile_outlines = true 
+show_tile_outlines = true
+
+# cache icons/fonts to ~/.cache/wlgrid for fast startup; disable to always
+# do a full (slower) load, e.g. while iterating on desktop entries
+use_cache = true
 
 search = "[desktop,folders]"
 search_engines = """

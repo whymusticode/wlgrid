@@ -58,6 +58,8 @@ struct Config {
     border_alpha: Option<f32>,
     #[serde(default)]
     show_tile_outlines: Option<bool>,
+    #[serde(default)]
+    use_cache: Option<bool>,
 }
 
 /// Parse "#RRGGBB" or "RRGGBB" into [R, G, B]. Returns None on bad input.
@@ -788,10 +790,12 @@ fn main() {
     let cursor_surface = compositor.create_surface(&qh);
     dlog!("  cursor theme deferred");
 
+    let use_cache = config.use_cache.unwrap_or(true);
+
     // Try to load from cache first (fast path). Reject it if the cached
     // icon dimensions don't match the configured icon_size — the user may
     // have changed `icon_size` in config.toml since the cache was written.
-    let cached = load_cache().filter(|cache| {
+    let cached = use_cache.then(load_cache).flatten().filter(|cache| {
         cache.icons.iter().all(|i| i.width == icon_size && i.height == icon_size)
     });
     let mut cache_write_paths: Option<(Option<PathBuf>, Option<PathBuf>)> = None;
@@ -823,7 +827,9 @@ fn main() {
             Some(fp) => (Some(fp.fonts), (Some(fp.text_path), fp.symbols_path)),
             None => (None, (None, None)),
         };
-        cache_write_paths = Some(paths);
+        if use_cache {
+            cache_write_paths = Some(paths);
+        }
 
         // Load desktop entries
         let icons = load_desktop_entries(icon_size, fonts.as_ref());
@@ -922,6 +928,7 @@ fn main() {
         pointer_enter_serial: 0,
         startup_time,
         cache_write_paths,
+        use_cache,
         probe_draw_ms: Vec::new(),
     };
 
@@ -1188,6 +1195,7 @@ struct App {
     // Startup timing
     startup_time: Instant,
     cache_write_paths: Option<(Option<PathBuf>, Option<PathBuf>)>,
+    use_cache: bool,
     probe_draw_ms: Vec<f32>,
 }
 
@@ -1774,7 +1782,9 @@ impl App {
         self.icons_checksum = current_checksum;
 
         // Save new cache (without font paths since we don't have them here)
-        save_cache(&self.icons, None, None);
+        if self.use_cache {
+            save_cache(&self.icons, None, None);
+        }
 
         true
     }

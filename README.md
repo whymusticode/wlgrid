@@ -23,6 +23,7 @@ gif compressed a good amount, here's it without compression:
 - Designed with touchscreen use in mind
 - Nerd Font integration:
   - Put a Nerd Font glyph in a desktop entry name and it'll be used as the icon if no image icon is found
+  - extra entries use their glyph as the icon too.
 
 wlgrid -t to get timings 
 wlgrid -h to get help 
@@ -64,6 +65,9 @@ nix build is runnable in a standard nix bash environment
 - Arrow keys to navigate tiles
 - Enter to launch the focused app
 - Type to desktop entries
+- Delete clears a tile. Escape clears the search, then closes the picker, then quits. Up/Down pick a
+    search result. Line 66 "Type to desktop entries" reads garbled; maybe "Type to search apps; up to 8 results,
+    Enter launches".
 
 **Bottom bar**
 - Customizable quick-action buttons (logout, reboot, any shell command, etc.)
@@ -138,12 +142,12 @@ nix run github:whymusticode/wlgrid
 
 **Debian/Ubuntu**
 ```bash
-sudo apt install build-essential cargo clang mold libwayland-dev libxkbcommon-dev
+sudo apt install build-essential cargo clang mold libxkbcommon-dev
 ```
 
 **Arch Linux**
 ```bash
-sudo pacman -S rust clang mold wayland libxkbcommon
+sudo pacman -S rust clang mold libxkbcommon
 ```
 
 Then build and install:
@@ -157,6 +161,10 @@ sudo cp target/release/wlgrid /usr/local/bin/
 ## Runtime dependencies
 
 - Wayland compositor (with `wp_viewporter`, which all major compositors support)
+- A regular sans font (DejaVu Sans, Liberation Sans, Noto Sans, Ubuntu or Roboto are
+  preferred); wlgrid exits at startup if it finds none
+- Symbols Nerd Font (optional) for Nerd Font glyph icons
+- Builds from source outside Nix also link glibc and libxkbcommon dynamically
 
 Nix builds (`nix build`, or `cargo build --release` inside `nix develop`) are fully
 statically linked and can be copied to any x86_64 Linux machine. Inside `nix develop`

@@ -63,11 +63,8 @@ nix build is runnable in a standard nix bash environment
 
 **Keyboard**
 - Arrow keys to navigate tiles
-- Enter to launch the focused app
-- Type to desktop entries
-- Delete clears a tile. Escape clears the search, then closes the picker, then quits. Up/Down pick a
-    search result. Line 66 "Type to desktop entries" reads garbled; maybe "Type to search apps; up to 8 results,
-    Enter launches".
+- Type to search apps; up to 8 results, Enter launches, enter on empty opens picker
+- Delete clears a tile. Escape clears the search, then closes the picker, then quits. Up/Down pick a search result.
 
 **Bottom bar**
 - Customizable quick-action buttons (logout, reboot, any shell command, etc.)

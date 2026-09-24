@@ -20,6 +20,7 @@ strip = "symbols"
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
 wayland-cursor = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
@@ -29,9 +30,6 @@ walkdir = "2"
 ab_glyph = "0.2"
 bincode = "1"
 libc = "0.2"
-glow = "0.17.0"
-khronos-egl = { version = "6.0.0", features = ["dynamic"] }
-wayland-egl = "0.32.11"
 bytemuck = "1.25.0"
 
 [dev-dependencies]

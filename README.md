@@ -24,6 +24,8 @@ gif compressed a good amount, here's it without compression:
 - Nerd Font integration:
   - Put a Nerd Font glyph in a desktop entry name and it'll be used as the icon if no image icon is found
 
+wlgrid -t to get timings 
+wlgrid -h to get help 
 
 <!-- list of things to manually test before a release, also improves documentation -->
 
@@ -154,5 +156,8 @@ sudo cp target/release/wlgrid /usr/local/bin/
 
 ## Runtime dependencies
 
-- Wayland compositor
-- OpenGL/EGL (Mesa or any vendor driver)
+- Wayland compositor (with `wp_viewporter`, which all major compositors support)
+
+Nix builds (`nix build`, or `cargo build --release` inside `nix develop`) are fully
+statically linked and can be copied to any x86_64 Linux machine. Inside `nix develop`
+the binary lands in `target/x86_64-unknown-linux-gnu/release/wlgrid`.

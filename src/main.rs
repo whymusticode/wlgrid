@@ -1,15 +1,13 @@
-use std::borrow::Cow;
 use std::env;
 use std::process::Command;
-use std::time::Instant;
 use std::thread;
 use serde::{Deserialize, Serialize};
 use ab_glyph::{Font, ScaleFont, point};
-mod gpu_gl;
-use gpu_gl::{GlCmd, GlRect, GlSprite};
+mod canvas;
+use canvas::Canvas;
 
 // Pure-logic helpers shared with benches
-use wlgrid::{dlog, Icon, IconCache, Fonts, load_entries, make_placeholder_icon};
+use wlgrid::{dlog, Icon, IconCache, Fonts, load_entries};
 
 // ── config ──
 
@@ -211,8 +209,7 @@ fn save_state(tiles: Vec<Option<String>>) {
 
 // ── text rendering ──
 
-/// Rasterise `text` into a tight RGBA coverage buffer (white pixels, alpha =
-/// glyph coverage) for upload as a GL texture, tinted at draw time. The internal
+/// Rasterise `text` into a tight 8-bit coverage mask, tinted at draw time. The internal
 /// baseline sits `ascent` px from the top (returned as the 4th element), so a
 /// caller wanting a baseline at `baseline_y` draws the buffer at
 /// `y = baseline_y - ascent`. Returns None for empty / zero-width text.
@@ -227,7 +224,7 @@ fn rasterize_text(fonts: &Fonts, text: &str, size: f32) -> Option<(Vec<u8>, u32,
     let base = fonts.text.as_scaled(size);
     let ascent = base.ascent();
     let h = (base.ascent() - base.descent()).ceil().max(1.0) as u32;
-    let mut buf = vec![0u8; (w * h * 4) as usize];
+    let mut buf = vec![0u8; (w * h) as usize];
     let mut pen_x = 0.0f32;
     for c in text.chars() {
         let font = fonts.for_char(c);
@@ -241,12 +238,10 @@ fn rasterize_text(fonts: &Fonts, text: &str, size: f32) -> Option<(Vec<u8>, u32,
                     return;
                 }
                 let alpha = (cov * 255.0) as u8;
-                let idx = ((py as u32 * w + px as u32) * 4) as usize;
                 // Glyphs shouldn't overlap, but if they do keep the strongest
                 // coverage rather than letting later glyphs erase earlier ones.
-                if alpha > buf[idx + 3] {
-                    buf[idx..idx + 4].copy_from_slice(&[0xFF, 0xFF, 0xFF, alpha]);
-                }
+                let cov = &mut buf[(py as u32 * w + px as u32) as usize];
+                *cov = (*cov).max(alpha);
             });
         }
         pen_x += font.as_scaled(size).h_advance(gid);
@@ -267,20 +262,15 @@ fn rgba4(c: [u8; 4]) -> [f32; 4] {
 const NONE: [f32; 4] = [0.0; 4];
 const WHITE: [u8; 4] = [0xFF; 4];
 
-#[allow(clippy::too_many_arguments)]
-fn rect(x: i32, y: i32, w: i32, h: i32, radius: f32, fill: [f32; 4], border: [f32; 4], border_w: f32) -> GlCmd<'static> {
-    GlCmd::Rect(GlRect { x, y, w, h, radius, fill, border, border_w })
-}
-
 /// Whether (x, y) lies inside the rect (rx, ry, rw, rh).
 fn hit((rx, ry, rw, rh): (i32, i32, i32, i32), x: f64, y: f64) -> bool {
     x >= rx as f64 && x < (rx + rw) as f64 && y >= ry as f64 && y < (ry + rh) as f64
 }
 
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm, delegate_touch,
+    delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor, delegate_touch,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -297,13 +287,16 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::{Shm, ShmHandler},
+    shm::{slot::SlotPool, Shm, ShmHandler},
+    subcompositor::SubcompositorState,
 };
 use wayland_client::{
+    delegate_noop,
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface, wl_touch},
-    Connection, Proxy, QueueHandle,
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_subsurface, wl_surface, wl_touch},
+    Connection, QueueHandle,
 };
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 use wayland_cursor::CursorTheme;
 
 // ── launching ──
@@ -397,29 +390,47 @@ fn acquire_instance_lock() -> Option<std::fs::File> {
     Some(file)
 }
 
+const HELP: &str = "\
+wlgrid - grid launcher for Wayland
+
+Usage: wlgrid [-t]
+
+Options:
+  -t          Print a timestamped log of startup (and later events) to stderr
+  -h, --help  Show this help
+
+Only one instance runs at a time; launching again while open does nothing.
+
+Controls:
+  Arrow keys        Move between tiles (and picker items / search results)
+  Enter / click     Launch the tile's app, or open the app picker on an empty tile
+  Type              Search apps; Enter launches the selected result
+  Delete / right-click  Clear the tile
+  Drag              Rearrange tiles (drop on another tile to swap)
+  Escape            Clear search, close the picker, or quit
+
+Files:
+  ~/.config/wlgrid/wlgrid.toml  Config (written with defaults on first run;
+                                /etc/wlgrid/wlgrid.toml is the fallback)
+  ~/.config/wlgrid/state.json   Tile layout
+  ~/.cache/wlgrid/icons.bin     Decoded icon cache (safe to delete)
+";
+
 fn main() {
+    if env::args().any(|a| a == "-h" || a == "--help") {
+        print!("{HELP}");
+        return;
+    }
+
     // `-t`: print a timestamped log of startup (and everything after) to stderr.
     if env::args().any(|a| a == "-t") {
         wlgrid::enable_log();
     }
     dlog!("wlgrid starting");
 
-    // Probe mode is a one-shot diagnostic that exits quickly; allow it to run
-    // even if another instance holds the lock. Detected early so the lock
-    // file handling stays simple.
-    let probe_mode = env::args().any(|a| a == "--ci-probe");
-
     // Refuse to start a second instance. Silent exit — intentional for hotkey use.
-    let _instance_lock = if probe_mode {
-        None
-    } else {
-        match acquire_instance_lock() {
-            Some(f) => Some(f),
-            None => return,
-        }
-    };
+    let Some(_instance_lock) = acquire_instance_lock() else { return };
 
-    let startup_time = Instant::now();
     dlog!("instance lock acquired");
 
     // ── connect to wayland ──
@@ -456,6 +467,19 @@ fn main() {
     layer.set_exclusive_zone(-1); // don't push other surfaces
     layer.commit();
     dlog!("layer surface committed");
+
+    // Content subsurface. It takes no input, so pointer/touch events keep
+    // arriving on the layer surface in full-screen coordinates.
+    let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
+        .expect("wl_subcompositor missing");
+    let (subsurface, content) = subcompositor.create_subsurface(layer.wl_surface().clone(), &qh);
+    subsurface.set_desync();
+    let no_input = Region::new(&compositor).expect("wl_region");
+    content.set_input_region(Some(no_input.wl_region()));
+    let viewport = globals.bind::<WpViewporter, _, _>(&qh, 1..=1, ()).ok()
+        .map(|vp| vp.get_viewport(layer.wl_surface(), &qh, ()));
+    let pool = SlotPool::new(4096, &shm).expect("wl_shm pool");
+    dlog!("content subsurface created (viewporter: {})", viewport.is_some());
 
     // Fonts are needed before entries so icon-less entries can render their name.
     let Some(fonts) = Fonts::load() else {
@@ -506,7 +530,6 @@ fn main() {
         dirty: true,
         frame_pending: false,
         first_frame_presented: false,
-        icons_at_first_frame: 0,
         picker_target: None,
         picker_scroll: 0,
         picker_hovered: None,
@@ -515,185 +538,27 @@ fn main() {
         search_sel: 0,
         fonts,
         theme: Theme::from_config(&config),
-        gl_renderer: None,
+        content,
+        subsurface,
+        viewport,
+        pool: Some(pool),
+        scaled_icons: canvas::IconCache::new(),
+        backdrop: None,
         cursor_theme: None, // loaded lazily on first pointer enter
         cursor_surface: compositor.create_surface(&qh),
-        probe_draw_ms: Vec::new(),
     };
     app.tiles = app.tiles_from_names(&load_state().tiles);
     dlog!("state restored ({} tiles filled), entering event loop", app.tiles.iter().flatten().count());
 
-    // Probe mode: run a polling event loop, exit after quiescence with metrics.
-    let exit_code = if probe_mode {
-        run_probe_loop(&conn, &mut event_queue, &mut app, startup_time)
-    } else {
-        loop {
-            event_queue.blocking_dispatch(&mut app).unwrap();
-            if app.exit { break; }
-        }
-        0
-    };
+    while !app.exit {
+        event_queue.blocking_dispatch(&mut app).unwrap();
+    }
 
     save_state(app.tile_names());
     if let Some(h) = app.cache_saver.take() {
         let _ = h.join();
     }
     dlog!("  exiting");
-
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
-}
-
-/// Drive the event loop in probe mode: dispatch Wayland events via a
-/// poll-with-timeout loop so we can detect when the app has settled into a
-/// steady state (no pending draws, no pending frame callbacks, no inbound
-/// events for a quiescence window). Prints timing metrics to stdout and
-/// returns an exit code.
-///
-/// Used by CI (`wlgrid --ci-probe` under a headless compositor) to catch
-/// regressions in the startup / first-frame pipeline that pure criterion
-/// benches can't see — e.g. "first committed frame was empty because icons
-/// hadn't loaded yet".
-fn run_probe_loop(
-    conn: &Connection,
-    event_queue: &mut wayland_client::EventQueue<App>,
-    app: &mut App,
-    startup_time: Instant,
-) -> i32 {
-    use std::os::fd::AsRawFd;
-    use std::time::Duration;
-
-    const QUIESCE_MS: u64 = 50;
-    const HARD_TIMEOUT: Duration = Duration::from_secs(10);
-
-    let mut last_activity = Instant::now();
-    let mut time_to_first_frame: Option<Duration> = None;
-
-    loop {
-        // Flush any pending requests to the compositor.
-        if conn.flush().is_err() {
-            eprintln!("probe: flush error");
-            return 1;
-        }
-
-        // Dispatch any events already queued (non-blocking).
-        let dispatched = event_queue.dispatch_pending(app).unwrap_or(0);
-
-        if app.exit { break; }
-
-        if time_to_first_frame.is_none() && app.first_frame_presented {
-            time_to_first_frame = Some(startup_time.elapsed());
-        }
-
-        let busy = app.dirty || app.frame_pending || dispatched > 0;
-        if busy {
-            last_activity = Instant::now();
-        }
-
-        // Quiesced: the first frame has been presented and the app has been
-        // idle for at least QUIESCE_MS.
-        let idle_for = last_activity.elapsed();
-        if !busy
-            && time_to_first_frame.is_some()
-            && idle_for.as_millis() as u64 >= QUIESCE_MS
-        {
-            break;
-        }
-
-        if startup_time.elapsed() > HARD_TIMEOUT {
-            eprintln!("probe: hard timeout reached ({:?})", HARD_TIMEOUT);
-            return 2;
-        }
-
-        // Prepare to read events from the Wayland fd, polling with a timeout
-        // so the quiescence check runs periodically even when nothing arrives.
-        let Some(guard) = conn.prepare_read() else {
-            // Another read is already in progress — retry dispatch.
-            continue;
-        };
-
-        let fd = guard.connection_fd();
-        let remaining = Duration::from_millis(QUIESCE_MS).saturating_sub(idle_for);
-        let timeout_ms = remaining.as_millis().min(50) as i32;
-
-        let mut pfd = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-
-        if n > 0 && (pfd.revents & libc::POLLIN) != 0 {
-            // Data arrived — read it into the queue.
-            if guard.read().is_err() {
-                eprintln!("probe: read error");
-                return 1;
-            }
-        } else {
-            // Timeout (or signal) — drop the guard without reading.
-            drop(guard);
-        }
-    }
-
-    // Quiesced. Emit metrics.
-    let tiles_filled = app.tiles.iter().filter(|t| t.is_some()).count();
-    let first_frame_ms = time_to_first_frame
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    // Count how many icons are the procedural "?" placeholder vs real.
-    // `make_placeholder_icon` is deterministic, so any icon with matching
-    // pixels came from the fallback path rather than a real icon file.
-    let placeholder_pixels = make_placeholder_icon(app.icon_size);
-    let placeholder_icons = app.icons.iter()
-        .filter(|i| i.pixels == placeholder_pixels)
-        .count();
-    let real_icons = app.icons.len() - placeholder_icons;
-    let steady_ms = startup_time.elapsed().as_millis();
-    let steady_minus_quiesce_ms = steady_ms.saturating_sub(QUIESCE_MS as u128);
-    let draw_count = app.probe_draw_ms.len();
-    let draw_avg_ms = if draw_count == 0 {
-        0.0
-    } else {
-        app.probe_draw_ms.iter().copied().map(|v| v as f64).sum::<f64>() / draw_count as f64
-    };
-    let draw_p95_ms = if draw_count == 0 {
-        0.0
-    } else {
-        let mut s = app.probe_draw_ms.clone();
-        s.sort_by(|a, b| a.total_cmp(b));
-        let idx = (((s.len() - 1) as f32) * 0.95).round() as usize;
-        s[idx] as f64
-    };
-
-    println!("probe: time_to_first_frame_ms={}", first_frame_ms);
-    println!("probe: time_to_steady_state_ms={}", steady_ms);
-    println!("probe: time_to_steady_state_minus_quiesce_ms={}", steady_minus_quiesce_ms);
-    println!("probe: quiesce_ms={}", QUIESCE_MS);
-    println!("probe: icons_loaded={}", app.icons.len());
-    println!("probe: real_icons_loaded={}", real_icons);
-    println!("probe: placeholder_icons_loaded={}", placeholder_icons);
-    println!("probe: icons_at_first_frame={}", app.icons_at_first_frame);
-    println!("probe: tiles_filled={}/{}", tiles_filled, app.tiles.len());
-    println!("probe: draw_count={}", draw_count);
-    println!("probe: draw_avg_ms={:.2}", draw_avg_ms);
-    println!("probe: draw_p95_ms={:.2}", draw_p95_ms);
-
-    // Regression check: if the final icon count is > 0 but the first-frame
-    // snapshot was 0, that means icons loaded *after* the first draw — the
-    // exact ordering bug we care about catching. Fail loudly.
-    if !app.icons.is_empty() && app.icons_at_first_frame == 0 {
-        eprintln!(
-            "probe: FAIL — first frame was drawn with 0 icons but {} icons \
-             were loaded by steady state. Icon loading happened after the \
-             first draw; this will show empty tiles to the user.",
-            app.icons.len()
-        );
-        return 3;
-    }
-
-    0
 }
 
 const BTN_LEFT: u32 = 0x110;
@@ -713,6 +578,9 @@ const PICKER_SEARCH_HEIGHT: i32 = 32;
 const SEARCH_MAX_RESULTS: usize = 8;
 const SEARCH_HEADER_H: f32 = 44.0;
 const SEARCH_ROW_H: f32 = 36.0;
+
+/// Extra darkening (black alpha) behind the open picker.
+const PICKER_DIM: f32 = 0.5;
 
 struct App {
     registry_state: RegistryState,
@@ -751,8 +619,7 @@ struct App {
     // Rendering state
     dirty: bool,
     frame_pending: bool,
-    first_frame_presented: bool,  // set true when the first frame callback fires (probe)
-    icons_at_first_frame: usize,  // snapshot of icons.len() at first frame time (probe)
+    first_frame_presented: bool,
     // Picker state
     picker_target: Option<usize>,    // which tile we're picking for (None = closed)
     picker_scroll: usize,            // index of the first visible filtered entry
@@ -764,82 +631,108 @@ struct App {
     // Required: wlgrid exits at startup if no usable font is found.
     fonts: Fonts,
     theme: Theme,
-    gl_renderer: Option<gpu_gl::GlRenderer>,
+    // Everything but the dim backdrop is drawn on this subsurface, sized to
+    // `content_region()`, so only that area is ever rasterised.
+    content: wl_surface::WlSurface,
+    subsurface: wl_subsurface::WlSubsurface,
+    viewport: Option<WpViewport>,
+    pool: Option<SlotPool>,          // taken while painting (see `draw`)
+    scaled_icons: canvas::IconCache,
+    backdrop: Option<(i32, i32, u8)>, // (width, height, alpha) currently attached
     cursor_theme: Option<CursorTheme>,
     cursor_surface: wl_surface::WlSurface,
-    probe_draw_ms: Vec<f32>,
 }
 
 impl App {
-    fn record_draw_ms(&mut self, ms: f32) {
-        if self.probe_draw_ms.len() >= 2048 {
-            let _ = self.probe_draw_ms.remove(0);
-        }
-        self.probe_draw_ms.push(ms);
-    }
-
     /// Mark the frame dirty and make sure a frame callback will redraw it.
     fn redraw(&mut self, qh: &QueueHandle<Self>) {
         self.dirty = true;
         if !self.frame_pending {
-            self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
-            self.layer.commit();
+            self.content.frame(qh, self.content.clone());
+            self.content.commit();
             self.frame_pending = true;
         }
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) {
-        let t0 = Instant::now();
         self.dirty = false;
-        let Some(mut renderer) = self.gl_renderer.take() else { return };
-        let cmds = self.frame_cmds();
-        if let Err(e) = renderer.render(self.theme.dim, &cmds) {
-            eprintln!("wlgrid: gl render failed: {e}");
+        if self.width == 0 {
+            return; // not configured yet
         }
-        drop(cmds);
-        self.gl_renderer = Some(renderer);
+        self.update_backdrop();
 
-        self.layer.wl_surface().damage_buffer(0, 0, self.width, self.height);
-        self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
-        self.layer.commit();
-        self.frame_pending = true;
-        self.record_draw_ms(t0.elapsed().as_secs_f64() as f32 * 1000.0);
+        // Paint into a fresh shm buffer. The pool and icon cache are moved out
+        // for the duration so `paint` can borrow the rest of `self`.
+        let (rx, ry, rw, rh) = self.content_region();
+        let mut pool = self.pool.take().expect("shm pool");
+        let mut icons = std::mem::take(&mut self.scaled_icons);
+        match pool.create_buffer(rw, rh, rw * 4, wl_shm::Format::Argb8888) {
+            Ok((buffer, bytes)) => {
+                self.paint(&mut Canvas::new(bytemuck::cast_slice_mut(bytes), rw, rh, (rx, ry), &mut icons));
+                self.subsurface.set_position(rx / self.scale, ry / self.scale);
+                self.content.set_buffer_scale(self.scale);
+                buffer.attach_to(&self.content).expect("buffer attach");
+                self.content.damage_buffer(0, 0, rw, rh);
+                self.content.frame(qh, self.content.clone());
+                self.content.commit();
+                // The subsurface position and backdrop apply on the parent's commit.
+                self.layer.commit();
+                self.frame_pending = true;
+            }
+            Err(e) => eprintln!("wlgrid: shm buffer allocation failed: {e}"),
+        }
+        self.pool = Some(pool);
+        self.scaled_icons = icons;
     }
 
-    /// Sprite for entry `idx`. Keyed by index so its texture is uploaded once
-    /// and reused; the GPU scales it to `size` for free via LINEAR sampling.
-    fn icon_cmd(&self, idx: usize, x: i32, y: i32, size: i32) -> GlCmd<'_> {
-        let src = self.icon_size as i32;
-        GlCmd::Sprite(GlSprite {
-            key: idx as u64 + 1, x, y, w: size, h: size,
-            pixels: Cow::Borrowed(&self.icons[idx].pixels), src_w: src, src_h: src, tint: [1.0; 4],
-        })
+    /// Attach the dim backdrop to the full-screen layer surface if it changed.
+    /// With wp_viewporter it's a single pixel the compositor stretches, so the
+    /// full screen costs nothing to draw; otherwise a logical-size buffer.
+    fn update_backdrop(&mut self) {
+        let dim = self.theme.dim;
+        let alpha = if self.picker_target.is_some() { dim + (1.0 - dim) * PICKER_DIM } else { dim };
+        let key = (self.width, self.height, (alpha * 255.0).round() as u8);
+        if self.backdrop == Some(key) {
+            return;
+        }
+        self.backdrop = Some(key);
+        let (lw, lh) = (self.width / self.scale, self.height / self.scale);
+        let (bw, bh) = if self.viewport.is_some() { (1, 1) } else { (lw, lh) };
+        let pool = self.pool.as_mut().expect("shm pool");
+        let Ok((buffer, bytes)) = pool.create_buffer(bw, bh, bw * 4, wl_shm::Format::Argb8888) else { return };
+        bytemuck::cast_slice_mut::<u8, u32>(bytes).fill((key.2 as u32) << 24); // premultiplied black
+        if let Some(v) = &self.viewport {
+            v.set_destination(lw, lh);
+        }
+        let surface = self.layer.wl_surface();
+        buffer.attach_to(surface).expect("buffer attach");
+        surface.damage_buffer(0, 0, bw, bh);
     }
 
-    /// Rasterise `text` as a tinted sprite whose baseline lands at `baseline_y`.
+    /// Draw entry `idx`'s icon at `size` px. The canvas caches each scaled
+    /// icon, so source icons stay at their base resolution.
+    fn icon(&self, c: &mut Canvas, idx: usize, x: i32, y: i32, size: i32) {
+        c.icon(idx, &self.icons[idx].pixels, self.icon_size as i32, x, y, size);
+    }
+
+    /// Draw `text` tinted `color` with its baseline at `baseline_y`.
     #[allow(clippy::too_many_arguments)]
-    fn text_cmd(&self, cmds: &mut Vec<GlCmd<'_>>, x: i32, baseline_y: i32, text: &str, size: f32, color: [u8; 4]) {
-        if let Some((buf, w, h, ascent)) = rasterize_text(&self.fonts, text, size) {
-            cmds.push(GlCmd::Sprite(GlSprite {
-                key: 0, x, y: baseline_y - ascent, w: w as i32, h: h as i32,
-                pixels: Cow::Owned(buf), src_w: w as i32, src_h: h as i32, tint: rgba4(color),
-            }));
+    fn text(&self, c: &mut Canvas, x: i32, baseline_y: i32, text: &str, size: f32, color: [u8; 4]) {
+        if let Some((mask, w, h, ascent)) = rasterize_text(&self.fonts, text, size) {
+            c.mask(&mask, w as i32, h as i32, x, baseline_y - ascent, rgba4(color));
         }
     }
 
-    /// Build the frame as an ordered (z-order) list of GL primitives. All
-    /// scaling happens here at draw time — source icons stay at their base
-    /// resolution and only the on-screen ones are ever touched.
-    fn frame_cmds(&self) -> Vec<GlCmd<'_>> {
+    /// Paint the content subsurface: grid, then drag / picker / search overlays.
+    fn paint(&self, c: &mut Canvas) {
         let t = self.theme;
         let s = self.scale as f32;
         let (ox, oy) = self.grid_offset();
         let (cw, ch) = self.content_size();
         let eff = (self.icon_size as f32 * s).round().max(1.0) as i32;
-        let mut c: Vec<GlCmd> = Vec::new();
 
         // Panel backing the whole grid.
-        c.push(rect(ox, oy, cw, ch, t.radius * s, rgba3(t.panel, t.panel_a), rgba3(t.border, (t.border_a * 0.9).min(1.0)), s));
+        c.rect(ox, oy, cw, ch, t.radius * s, rgba3(t.panel, t.panel_a), rgba3(t.border, (t.border_a * 0.9).min(1.0)), s);
 
         // Grid tiles + their icons.
         let hover = accent_delta(t.tile, t.tile_a, t.accent_hue_delta, t.accent_amount);
@@ -847,9 +740,9 @@ impl App {
             let (tx, ty, ts, _) = self.tile_rect(i);
             let (fill, fa) = if self.hovered_tile == Some(i) { hover } else { (t.tile, t.tile_a) };
             let outline = if t.show_tile_outlines { s } else { 0.0 };
-            c.push(rect(tx, ty, ts, ts, t.radius * s, rgba3(fill, fa), rgba3(t.border, t.border_a), outline));
+            c.rect(tx, ty, ts, ts, t.radius * s, rgba3(fill, fa), rgba3(t.border, t.border_a), outline);
             if let Some(idx) = self.tiles[i].filter(|_| self.drag_from != Some(i)) {
-                c.push(self.icon_cmd(idx, tx + (ts - eff) / 2, ty + (ts - eff) / 2, eff));
+                self.icon(c, idx, tx + (ts - eff) / 2, ty + (ts - eff) / 2, eff);
             }
         }
 
@@ -857,39 +750,39 @@ impl App {
         if let Some(from) = self.drag_from {
             if let Some(to) = self.hovered_tile.filter(|&to| to != from) {
                 let (tx, ty, ts, _) = self.tile_rect(to);
-                c.push(rect(tx, ty, ts, ts, t.radius * s, NONE, [0.0, 1.0, 0.0, 1.0], (2.0 * s).max(1.0)));
+                c.rect(tx, ty, ts, ts, t.radius * s, NONE, [0.0, 1.0, 0.0, 1.0], (2.0 * s).max(1.0));
             }
             if let Some(idx) = self.tiles[from] {
                 let (px, py) = (self.pointer_pos.0 as i32, self.pointer_pos.1 as i32);
-                c.push(self.icon_cmd(idx, px - eff / 2, py - eff / 2, eff));
+                self.icon(c, idx, px - eff / 2, py - eff / 2, eff);
             }
         }
 
         if self.picker_target.is_some() {
-            self.picker_cmds(&mut c, eff);
+            // Darken the grid like the (also darkened) background behind it.
+            c.rect(ox, oy, cw, ch, t.radius * s, [0.0, 0.0, 0.0, PICKER_DIM], NONE, 0.0);
+            self.paint_picker(c, eff);
         }
         if !self.search_query.is_empty() {
-            self.search_cmds(&mut c);
+            self.paint_search(c);
         }
-        c
     }
 
-    fn picker_cmds<'a>(&'a self, c: &mut Vec<GlCmd<'a>>, eff: i32) {
+    fn paint_picker(&self, c: &mut Canvas, eff: i32) {
         let s = self.scale as f32;
         let px_ = |v: f32| (v * s) as i32;
-        c.push(rect(0, 0, self.width, self.height, 0.0, [0.0, 0.0, 0.0, 0.5], NONE, 0.0));
         let (px, py, pw, ph) = self.picker_rect();
-        c.push(rect(px, py, pw, ph, self.theme.radius * s, rgba4([0x1A, 0x1A, 0x1A, 0xFF]), rgba4([0x55, 0x55, 0x55, 0xFF]), 2.0 * s));
+        c.rect(px, py, pw, ph, self.theme.radius * s, rgba4([0x1A, 0x1A, 0x1A, 0xFF]), rgba4([0x55, 0x55, 0x55, 0xFF]), 2.0 * s);
 
         let box_y = py + px_(8.0);
-        c.push(rect(px + px_(8.0), box_y, pw - px_(16.0), px_(PICKER_SEARCH_HEIGHT as f32), 4.0 * s,
-            rgba4([0x2D, 0x2D, 0x2D, 0xFF]), rgba4([0x55, 0x55, 0x55, 0xFF]), 1.0));
+        c.rect(px + px_(8.0), box_y, pw - px_(16.0), px_(PICKER_SEARCH_HEIGHT as f32), 4.0 * s,
+            rgba4([0x2D, 0x2D, 0x2D, 0xFF]), rgba4([0x55, 0x55, 0x55, 0xFF]), 1.0);
         let (query, color) = if self.picker_search.is_empty() {
             ("Type to search...", [0x88, 0x88, 0x88, 0xFF])
         } else {
             (self.picker_search.as_str(), WHITE)
         };
-        self.text_cmd(c, px + px_(12.0), box_y + px_(22.0), query, 16.0 * s, color);
+        self.text(c, px + px_(12.0), box_y + px_(22.0), query, 16.0 * s, color);
 
         let name_size = 10.0 * s;
         let max_chars = 10;
@@ -899,8 +792,8 @@ impl App {
             let (ix, iy, iw, ih) = self.picker_item_rect(vis);
             let hovered = self.picker_hovered == Some(vis);
             let bg = if hovered { [0x46, 0x46, 0x46, 0xFF] } else { [0x2D, 0x2D, 0x2D, 0xFF] };
-            c.push(rect(ix, iy, iw, ih, 4.0 * s, rgba4(bg), NONE, 0.0));
-            c.push(self.icon_cmd(idx, ix + (iw - eff) / 2, iy + px_(4.0), eff));
+            c.rect(ix, iy, iw, ih, 4.0 * s, rgba4(bg), NONE, 0.0);
+            self.icon(c, idx, ix + (iw - eff) / 2, iy + px_(4.0), eff);
 
             let name = &self.icons[idx].name;
             let truncated = name.chars().count() > max_chars;
@@ -910,7 +803,7 @@ impl App {
                 name.clone()
             };
             let tw = self.fonts.text_width(&label, name_size) as i32;
-            self.text_cmd(c, ix + (iw - tw) / 2, iy + ih - px_(4.0), &label, name_size, [0xCC, 0xCC, 0xCC, 0xFF]);
+            self.text(c, ix + (iw - tw) / 2, iy + ih - px_(4.0), &label, name_size, [0xCC, 0xCC, 0xCC, 0xFF]);
             if hovered && truncated {
                 tooltip = Some((name, ix, iy, iw));
             }
@@ -924,30 +817,30 @@ impl App {
             let tooltip_h = px_(20.0);
             let tx = (ix + (iw - tooltip_w) / 2).max(px + 4).min(px + pw - tooltip_w - 4);
             let ty = (iy - tooltip_h - px_(4.0)).max(py + 4);
-            c.push(rect(tx, ty, tooltip_w, tooltip_h, 4.0 * s, rgba4([0x00, 0x00, 0x00, 0xEE]), rgba4([0x88, 0x88, 0x88, 0xFF]), 1.0));
-            self.text_cmd(c, tx + padding, ty + px_(15.0), name, size, WHITE);
+            c.rect(tx, ty, tooltip_w, tooltip_h, 4.0 * s, rgba4([0x00, 0x00, 0x00, 0xEE]), rgba4([0x88, 0x88, 0x88, 0xFF]), 1.0);
+            self.text(c, tx + padding, ty + px_(15.0), name, size, WHITE);
         }
     }
 
-    fn search_cmds<'a>(&'a self, c: &mut Vec<GlCmd<'a>>) {
+    fn paint_search(&self, c: &mut Canvas) {
         let s = self.scale as f32;
         let px_ = |v: f32| (v * s) as i32;
         let matches = self.search_matches();
         let (bx, by, bw, bh) = self.search_rect(matches.len());
-        c.push(rect(bx, by, bw, bh, 6.0 * s, rgba4([0x18, 0x14, 0x10, 0xEE]), rgba4([0x60, 0x60, 0x80, 0xFF]), s.max(1.0)));
+        c.rect(bx, by, bw, bh, 6.0 * s, rgba4([0x18, 0x14, 0x10, 0xEE]), rgba4([0x60, 0x60, 0x80, 0xFF]), s.max(1.0));
         let color = if matches.is_empty() { [0xCC, 0xCC, 0xCC, 0xFF] } else { WHITE };
-        self.text_cmd(c, bx + px_(16.0), by + px_(30.0), &self.search_query, 24.0 * s, color);
+        self.text(c, bx + px_(16.0), by + px_(30.0), &self.search_query, 24.0 * s, color);
 
         let icon = px_(28.0);
         for (i, &idx) in matches.iter().enumerate() {
             let (rx, ry, rw, rh) = self.search_row_rect(i);
             let selected = i == self.search_sel;
             if selected {
-                c.push(rect(rx, ry, rw, rh, 4.0 * s, rgba4([0x46, 0x46, 0x46, 0xFF]), NONE, 0.0));
+                c.rect(rx, ry, rw, rh, 4.0 * s, rgba4([0x46, 0x46, 0x46, 0xFF]), NONE, 0.0);
             }
-            c.push(self.icon_cmd(idx, rx + px_(6.0), ry + (rh - icon) / 2, icon));
+            self.icon(c, idx, rx + px_(6.0), ry + (rh - icon) / 2, icon);
             let color = if selected { WHITE } else { [0xBB, 0xBB, 0xBB, 0xFF] };
-            self.text_cmd(c, rx + px_(44.0), ry + px_(24.0), &self.icons[idx].name, 16.0 * s, color);
+            self.text(c, rx + px_(44.0), ry + px_(24.0), &self.icons[idx].name, 16.0 * s, color);
         }
     }
 
@@ -964,6 +857,21 @@ impl App {
     fn grid_offset(&self) -> (i32, i32) {
         let (cw, ch) = self.content_size();
         ((self.width - cw) / 2, (self.height - ch) / 2)
+    }
+
+    /// Screen area the content subsurface covers: everything that can be
+    /// drawn (grid, picker, search box), aligned to whole logical pixels.
+    fn content_region(&self) -> (i32, i32, i32, i32) {
+        let (ox, oy) = self.grid_offset();
+        let (cw, ch) = self.content_size();
+        let (px, py, pw, ph) = self.picker_rect();
+        let (sx, sy, sw, sh) = self.search_rect(SEARCH_MAX_RESULTS);
+        let s = self.scale;
+        let x0 = (ox.min(px).min(sx).max(0) / s) * s;
+        let y0 = (oy.min(py).min(sy).max(0) / s) * s;
+        let x1 = ((ox + cw).max(px + pw).max(sx + sw).min(self.width) + s - 1) / s * s;
+        let y1 = ((oy + ch).max(py + ph).max(sy + sh).min(self.height) + s - 1) / s * s;
+        (x0, y0, x1 - x0, y1 - y0)
     }
 
     fn tile_rect(&self, index: usize) -> (i32, i32, i32, i32) {
@@ -1057,10 +965,8 @@ impl App {
             dlog!("  entries changed, reloaded {} entries", icons.len());
             self.icons = icons;
             self.tiles = self.tiles_from_names(&names);
-            // Sprite textures are keyed by entry index, which just shifted.
-            if let Some(r) = self.gl_renderer.as_mut() {
-                r.clear_textures();
-            }
+            // Scaled icons are keyed by entry index, which just shifted.
+            self.scaled_icons.clear();
         }
         self.save_cache_if_dirty();
     }
@@ -1302,32 +1208,18 @@ impl App {
 // ── handler impls ──
 
 impl CompositorHandler for App {
-    fn scale_factor_changed(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, surface: &wl_surface::WlSurface, new_factor: i32) {
+    fn scale_factor_changed(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, _surface: &wl_surface::WlSurface, new_factor: i32) {
+        // Fires for both the layer surface and the content subsurface. Only
+        // the content is drawn at `scale`; the backdrop buffer stays at 1.
         if new_factor < 1 || new_factor == self.scale {
             return;
         }
         dlog!("  scale_factor_changed: {} -> {}", self.scale, new_factor);
-        surface.set_buffer_scale(new_factor);
         self.width = self.width / self.scale * new_factor;
         self.height = self.height / self.scale * new_factor;
         self.scale = new_factor;
-        // Deliberately do NOT create the renderer here: before the first
-        // configure we don't yet know the real surface size, and creating a
-        // wl_egl_window at the wrong size then resizing it before its first
-        // buffer isn't reliably honored (the first frame lands in the
-        // top-left). configure() creates it once, at the correct size.
-        if let Some(r) = self.gl_renderer.as_mut() {
-            r.resize(self.width, self.height);
-        }
-        // If we've already presented a frame, set_buffer_scale has just made
-        // the currently-attached buffer render at the wrong size (e.g. a 1x
-        // buffer shown at 2x lands in the top-left quarter). Repaint a fresh,
-        // correctly-sized buffer now rather than committing the stale one via
-        // a frame request and waiting for the next frame callback / input event.
-        if !self.first_configure && self.gl_renderer.is_some() {
+        if !self.first_configure {
             self.draw(qh);
-        } else {
-            self.redraw(qh);
         }
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
@@ -1336,7 +1228,6 @@ impl CompositorHandler for App {
         if !self.first_frame_presented {
             dlog!("first frame presented");
             self.first_frame_presented = true;
-            self.icons_at_first_frame = self.icons.len();
             self.save_cache_if_dirty();
         }
         if self.dirty {
@@ -1356,25 +1247,11 @@ impl OutputHandler for App {
 
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) { self.exit = true; }
-    fn configure(&mut self, conn: &Connection, qh: &QueueHandle<Self>, _: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
+    fn configure(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
         let old_size = (self.width, self.height);
         if cfg.new_size.0 != 0 { self.width = cfg.new_size.0 as i32 * self.scale; }
         if cfg.new_size.1 != 0 { self.height = cfg.new_size.1 as i32 * self.scale; }
-
-        // GL is the only renderer. Created here (not at startup) because it
-        // needs the configured surface size.
         dlog!("layer surface configured {}x{}", self.width, self.height);
-        if self.gl_renderer.is_none() {
-            let (display, surface) = (conn.display().id(), self.layer.wl_surface().id());
-            match gpu_gl::GlRenderer::new(display, surface, self.width, self.height) {
-                Ok(r) => self.gl_renderer = Some(r),
-                Err(e) => eprintln!("wlgrid: gl init failed: {e}"),
-            }
-            dlog!("EGL + GL renderer initialised");
-        }
-        if let Some(r) = self.gl_renderer.as_mut() {
-            r.resize(self.width, self.height);
-        }
 
         if self.first_configure {
             self.first_configure = false;
@@ -1382,8 +1259,7 @@ impl LayerShellHandler for App {
             dlog!("first frame drawn and committed");
         } else if (self.width, self.height) != old_size {
             // A later configure changed our size: repaint immediately,
-            // otherwise the stale (now wrong-sized) buffer lingers until the
-            // next input event.
+            // otherwise the stale layout lingers until the next input event.
             self.draw(qh);
         }
     }
@@ -1547,6 +1423,9 @@ delegate_seat!(App);
 delegate_keyboard!(App);
 delegate_pointer!(App);
 delegate_touch!(App);
+delegate_subcompositor!(App);
+delegate_noop!(App: WpViewporter);
+delegate_noop!(App: WpViewport);
 delegate_layer!(App);
 delegate_registry!(App);
 

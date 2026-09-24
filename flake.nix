@@ -8,22 +8,27 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
 
-      # Link inputs shared by the package and the dev shell. xkbcommon is
-      # linked statically. libwayland must stay shared: Mesa's EGL identifies
-      # and drives our wl_display through the same libwayland instance, and a
-      # second (static) copy breaks eglGetDisplay. It and libglvnd's
-      # libEGL.so.1 (which dispatches to the GPU vendor's driver) are found
-      # via a RUNPATH baked in by build.rs, so no LD_LIBRARY_PATH is needed.
-      depsFor = pkgs:
-        let
-          libxkbcommon = pkgs.libxkbcommon.overrideAttrs (old: {
+      # Link inputs shared by the package and the dev shell. The binary is
+      # fully static (glibc included; rendering is CPU/wl_shm and the Wayland
+      # protocol is pure Rust, so nothing is dlopen'd), so it can be copied
+      # to any x86_64 Linux machine and run without /nix/store paths.
+      depsFor = pkgs: {
+        libs = [
+          (pkgs.libxkbcommon.overrideAttrs (old: {
             mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
             doCheck = false;
-          });
-        in {
-          libs = [ libxkbcommon pkgs.wayland ];
-          env.WLGRID_RPATH = pkgs.lib.makeLibraryPath [ pkgs.wayland pkgs.libglvnd ];
+          }))
+        ];
+        env = {
+          # Replaces .cargo/config.toml's rustflags, so repeat the mold flag.
+          # Static glibc is only on the target's search path: host build
+          # scripts still link dynamically.
+          RUSTFLAGS = "-C link-arg=-fuse-ld=mold -C target-feature=+crt-static -L native=${pkgs.glibc.static}/lib";
+          # An explicit target keeps RUSTFLAGS off build scripts and proc
+          # macros (which can't be static). Output: target/<triple>/release.
+          CARGO_BUILD_TARGET = pkgs.stdenv.hostPlatform.rust.rustcTarget;
         };
+      };
     in {
       packages = forAllSystems (pkgs:
         let deps = depsFor pkgs; in {
@@ -41,9 +46,6 @@
 
             buildInputs = deps.libs;
             env = deps.env;
-            # Keep libglvnd in the RUNPATH: it's dlopen'd, not DT_NEEDED, so
-            # the default RUNPATH shrinking would drop it.
-            dontPatchELF = true;
 
             meta = {
               description = "Wayland grid launcher";

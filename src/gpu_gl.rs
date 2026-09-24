@@ -1,5 +1,6 @@
 use glow::HasContext;
 use khronos_egl as egl;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use wayland_client::backend::ObjectId;
 use wayland_egl::WlEglSurface;
@@ -29,7 +30,7 @@ pub struct GlSprite<'a> {
     pub y: i32,
     pub w: i32,
     pub h: i32,
-    pub pixels: &'a [u8],
+    pub pixels: Cow<'a, [u8]>,
     pub src_w: i32,
     pub src_h: i32,
     pub tint: [f32; 4],
@@ -167,6 +168,14 @@ impl GlRenderer {
         })
     }
 
+    /// Drop every cached texture (e.g. after the entry list is reloaded and
+    /// sprite keys may now refer to different icons).
+    pub fn clear_textures(&mut self) {
+        for (_, t) in self.texture_cache.drain() {
+            unsafe { self.gl.delete_texture(t.tex); }
+        }
+    }
+
     pub fn resize(&mut self, width: i32, height: i32) {
         self.width = width.max(1);
         self.height = height.max(1);
@@ -221,9 +230,9 @@ impl GlRenderer {
             return Ok(());
         }
         let (tex, ephemeral) = if s.key == 0 {
-            (self.upload_texture(s.pixels, s.src_w, s.src_h)?, true)
+            (self.upload_texture(&s.pixels, s.src_w, s.src_h)?, true)
         } else {
-            (self.ensure_texture(s.key, s.pixels, s.src_w, s.src_h)?, false)
+            (self.ensure_texture(s.key, &s.pixels, s.src_w, s.src_h)?, false)
         };
         unsafe {
             let p = self.tex_program;
@@ -300,10 +309,8 @@ impl GlRenderer {
 
 impl Drop for GlRenderer {
     fn drop(&mut self) {
+        self.clear_textures();
         unsafe {
-            for (_, t) in self.texture_cache.drain() {
-                self.gl.delete_texture(t.tex);
-            }
             self.gl.delete_buffer(self.vbo);
             self.gl.delete_vertex_array(self.vao);
             self.gl.delete_program(self.tex_program);

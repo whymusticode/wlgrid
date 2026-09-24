@@ -6,25 +6,27 @@
   outputs = { self, nixpkgs }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
-    in {
-      packages = forAllSystems (system:
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
+
+      # Link inputs shared by the package and the dev shell. xkbcommon is
+      # linked statically. libwayland must stay shared: Mesa's EGL identifies
+      # and drives our wl_display through the same libwayland instance, and a
+      # second (static) copy breaks eglGetDisplay. It and libglvnd's
+      # libEGL.so.1 (which dispatches to the GPU vendor's driver) are found
+      # via a RUNPATH baked in by build.rs, so no LD_LIBRARY_PATH is needed.
+      depsFor = pkgs:
         let
-          pkgs = import nixpkgs { inherit system; };
-          runtimeLibs = with pkgs; [
-            wayland
-            mesa
-            # libglvnd provides the dlopen'd EGL/GLES dispatcher
-            # (libEGL.so.1 / libGLESv2.so.2); mesa only ships the vendor ICD.
-            libglvnd
-          ];
-          # Statically linked so the binary doesn't depend on the host's
-          # libxkbcommon.so.0 (SONAME/path drift between distros/updates was
-          # the most common "error while loading shared libraries" report).
-          libxkbcommonStatic = pkgs.libxkbcommon.overrideAttrs (old: {
+          libxkbcommon = pkgs.libxkbcommon.overrideAttrs (old: {
             mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Ddefault_library=static" ];
+            doCheck = false;
           });
         in {
+          libs = [ libxkbcommon pkgs.wayland ];
+          env.WLGRID_RPATH = pkgs.lib.makeLibraryPath [ pkgs.wayland pkgs.libglvnd ];
+        };
+    in {
+      packages = forAllSystems (pkgs:
+        let deps = depsFor pkgs; in {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "wlgrid";
             version = "0.1.0";
@@ -37,11 +39,11 @@
               clang
             ];
 
-            buildInputs = runtimeLibs ++ [ libxkbcommonStatic ];
-
-            postFixup = ''
-              patchelf --set-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" $out/bin/wlgrid
-            '';
+            buildInputs = deps.libs;
+            env = deps.env;
+            # Keep libglvnd in the RUNPATH: it's dlopen'd, not DT_NEEDED, so
+            # the default RUNPATH shrinking would drop it.
+            dontPatchELF = true;
 
             meta = {
               description = "Wayland grid launcher";
@@ -50,10 +52,8 @@
           };
         });
 
-      devShells = forAllSystems (system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-        in {
+      devShells = forAllSystems (pkgs:
+        let deps = depsFor pkgs; in {
           default = pkgs.mkShell {
             packages = with pkgs; [
               rustc
@@ -61,20 +61,8 @@
               pkg-config
               mold
               clang
-              wayland
-              libxkbcommon
-              mesa
-              libglvnd
-            ];
-            # Prepend the system's GL driver path so glvnd finds the running
-            # vendor ICD (mesa), and add libglvnd so the dlopen'd libEGL.so.1 /
-            # libGLESv2.so.2 dispatchers resolve at runtime under `cargo run`.
-            LD_LIBRARY_PATH = "/run/opengl-driver/lib:" + pkgs.lib.makeLibraryPath [
-              pkgs.wayland
-              pkgs.libxkbcommon
-              pkgs.mesa
-              pkgs.libglvnd
-            ];
+            ] ++ deps.libs;
+            env = deps.env;
           };
         });
     };

@@ -11,18 +11,47 @@ DISCLAIMER: this is vibe-coded to a large degree. I'm a dev of 15 years, but I d
 
 ![wlgrid launcher demo](output.gif)
 
-the gif compressed this so badly, it really does look a lot better:
+gif compressed a good amount, here's it without compression:
 
 ![wlgrid launcher demo](screenshot.png)
 
+<!-- LLMs do not edit the Features section. however you can read it and suggest additions, and you should be checking that you haven't broken/removed any of these -->
 ## Features
 - <100ms time-to-interactive 
 - <4000 LOC
 - HiDPI / fractional scaling support
 - Designed with touchscreen use in mind
 - Nerd Font integration:
-  - Icons in the bottom bar (see config below)
   - Put a Nerd Font glyph in a desktop entry name and it'll be used as the icon if no image icon is found
+
+
+<!-- list of things to manually test before a release, also improves documentation -->
+
+time to first frame:  <100 ms regardless scaling
+Lines Of Code: <= 4000
+
+left click/enter opens app picker to add icon
+right click/delete removes icon
+drag and drop icons (swap if dropping into occupied space)
+arrow keys move inside app picker and main grid
+type to find + launch desktop entries with 8 suggestions 
+pulls nerd fonts from desktop entries for icon if non available
+search engines 
+has a lock, so doesn't open a 2nd if you accidentally run the binary twice
+
+scaling works everywhere 
+TODO: include test to iterate through all the config params and see that they work
+
+pulls nerd font from desktop entry name as icon
+app picker (make sure it scales correctly and can take arrow keys)
+writes ~/.config/wlgrid/config.toml if none exists  based on binary bundled config.toml.default 
+
+cache feature so we don't have to reload icons. benched to save 10s of ms  
+
+
+
+needs: libwayland-client, libwayland-egl, libEGL + a GLES driver (Mesa or vendor), glibc. 
+nix build is runnable in a standard nix bash environment
 
 **Mouse**
 - Click and drag to rearrange tiles (layout persists across launches)
@@ -31,21 +60,21 @@ the gif compressed this so badly, it really does look a lot better:
 
 **Keyboard**
 - Arrow keys to navigate tiles
-- Arrow down from the bottom row enters the bottom bar; arrow up returns to the grid
-- Left/Right to navigate bottom bar items; Enter to activate
 - Enter to launch the focused app
-- Type to search:
-  - Matches desktop entries, zoxide directories, search engines, and files (hotkeys: `/`, `.`, `~`)
-  - Search sources and order are configurable — open a GH issue if you want a specific source integrated into search (e.g. krunner)
+- Type to desktop entries
 
 **Bottom bar**
 - Customizable quick-action buttons (logout, reboot, any shell command, etc.)
+<!-- end LLMs do not edit Features section  -->
+
+
+
 
 ## Config
 
-`~/.config/wlgrid/config.toml`
+`~/.config/wlgrid/wlgrid.toml` (an existing `config.toml` from older versions is renamed automatically)
 
-> Note: wlgrid also stores layout/cache state in this folder.
+> Note: wlgrid also stores the tile layout (`state.json`) in this folder; decoded icons are cached in `~/.cache/wlgrid`.
 
 ```toml
 width = 7 # in icons
@@ -67,23 +96,19 @@ border_color = "#10130c"
 border_alpha = 0.12
 show_tile_outlines = true
 
-# cache icons/fonts to ~/.cache/wlgrid for fast startup; disable to always
-# do a full (slower) load, e.g. while iterating on desktop entries
+# cache decoded icons to ~/.cache/wlgrid for fast startup; disable to always
+# re-resolve icon files (slower), e.g. while iterating on icon themes
 use_cache = true
 
-search = "[desktop,folders]"
-search_engines = """
-Duck = https://duckduckgo.com/?q={}
-Nix = https://search.nixos.org/packages?query={}
-"""   
-
-# good session cleanup is usually custom to your WM, e.g. "swaymsg exit" or "hyprshutdown" 
-[bottom_bar]
-font = 30
+# extra launchable entries, one "icon = command" per line. They show up in the
+# picker and type-to-launch like desktop entries, named by their command. The
+# icon is text, typically a Nerd Font glyph. Session cleanup is usually custom
+# to your WM, e.g. "swaymsg exit" or "hyprshutdown"
+[extra_entries]
 options = """
 󰍃 = swaymsg exit
-󰑓 = systemctl reboot 
-󰐥 = systemctl poweroff 
+󰑓 = systemctl reboot
+󰐥 = systemctl poweroff
 󰒲 = systemctl hibernate
 󰤄 = systemctl suspend
 """
@@ -131,4 +156,3 @@ sudo cp target/release/wlgrid /usr/local/bin/
 
 - Wayland compositor
 - OpenGL/EGL (Mesa or any vendor driver)
-- `zoxide` (optional — enables directory search)
